@@ -1,0 +1,3730 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VERSION="1.5.7"
+
+CAT_HOME="${CAT_HOME:-${HOME}/.catainer}"
+CONTAINERS_DIR="${CAT_HOME}/containers"
+CACHE_DIR="${CAT_HOME}/cache"
+TMP_DIR="${CAT_HOME}/tmp"
+SHARED_DIR="${CAT_HOME}/shared"
+UPDATE_CACHE="${CAT_HOME}/update-check"
+
+DEFAULT_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+C_RESET=""
+C_BOLD=""
+C_DIM=""
+C_RED=""
+C_GREEN=""
+C_YELLOW=""
+C_BLUE=""
+C_MAGENTA=""
+C_CYAN=""
+
+MAIN_ARGS=()
+
+setup_colors() {
+  case "${CAT_COLOR:-auto}" in
+    never) return 0 ;;
+    always) ;;
+    auto)
+      [[ -t 1 && -z "${NO_COLOR:-}" ]] || return 0
+      ;;
+    *)
+      [[ -t 1 && -z "${NO_COLOR:-}" ]] || return 0
+      ;;
+  esac
+
+  C_RESET=$'\033[0m'
+  C_BOLD=$'\033[1m'
+  C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'
+  C_MAGENTA=$'\033[35m'
+  C_CYAN=$'\033[36m'
+}
+
+note() {
+  printf '%bcatainer:%b %s\n' "$C_CYAN" "$C_RESET" "$*" >&2
+}
+
+warn() {
+  printf '%bcatainer: warning:%b %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2
+}
+
+die() {
+  printf '%bcatainer: error:%b %s\n' "$C_RED" "$C_RESET" "$*" >&2
+  exit 1
+}
+
+print_logo() {
+  cat <<EOF
+${C_CYAN}${C_BOLD}   ______      __        _
+  / ____/___ _/ /_____ _(_)___  ___  _____
+ / /   / __ \`/ __/ __ \`/ / __ \\/ _ \\/ ___/
+/ /___/ /_/ / /_/ /_/ / / / / /  __/ /
+\\____/\\__,_/\\__/\\__,_/_/_/ /_/\\___/_/${C_RESET}
+
+EOF
+}
+
+container_count() {
+  local count
+
+  if [[ -d "$CONTAINERS_DIR" ]]; then
+    count="$(find "$CONTAINERS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d '[:space:]')" || count="0"
+    printf '%s' "${count:-0}"
+  else
+    printf '0'
+  fi
+}
+
+print_overview() {
+  print_logo
+  cat <<EOF
+${C_BOLD}catainer ${VERSION}${C_RESET}
+Customizable proot Linux containers for Termux
+
+${C_GREEN}Usage:${C_RESET}
+  catainer create NAME --distro DISTRO [options]
+  catainer shell NAME
+  catainer exec NAME -- COMMAND
+  catainer login NAME
+  catainer link NAME
+  catainer status
+
+${C_GREEN}Setup:${C_RESET}
+  catainer status                 Show host, dependency, and compatibility overview
+  catainer setup                  Install Termux runtime dependencies
+  catainer updates                Check for catainer updates
+  catainer self-update            Update catainer from GitHub
+
+${C_GREEN}Discover:${C_RESET}
+  catainer sources                List supported distro sources
+  catainer releases DISTRO        List releases for a distro
+  catainer flavors DISTRO         List variants for a distro
+
+${C_GREEN}Containers:${C_RESET}
+  catainer create NAME            Create a container
+  catainer ls                     List installed containers
+  catainer inspect NAME           Show container configuration
+  catainer shell NAME             Enter a container shell
+  catainer exec NAME -- COMMAND   Run one command inside a container
+  catainer login NAME             Try distro PAM/login session
+  catainer link NAME              Create a direct launcher for a container
+  catainer upgrade NAME           Upgrade packages inside a container
+  catainer delete NAME            Delete a container
+
+${C_GREEN}Compatibility:${C_RESET}
+  catainer compat NAME android-safe
+  catainer doctor NAME --run-tests
+
+${C_GREEN}Storage:${C_RESET}
+  Containers: ${CONTAINERS_DIR} (${C_BOLD}$(container_count)${C_RESET} installed)
+  Cache:      ${CACHE_DIR}
+
+Run ${C_BOLD}catainer --help${C_RESET} for all commands.
+EOF
+}
+
+require_option_value() {
+  local option="$1"
+  local value="${2:-}"
+
+  [[ -n "$value" ]] || die "option $option requires a value"
+}
+
+parse_top_level_args() {
+  MAIN_ARGS=()
+
+  while (($#)); do
+    case "$1" in
+      --)
+        shift
+        MAIN_ARGS=("$@")
+        return 0
+        ;;
+      -h|--help|help|-V|--version|version)
+        MAIN_ARGS=("$@")
+        return 0
+        ;;
+      --color)
+        require_option_value "$1" "${2:-}"
+        CAT_COLOR="$2"
+        shift 2
+        ;;
+      --color=*)
+        CAT_COLOR="${1#*=}"
+        shift
+        ;;
+      --no-color)
+        CAT_COLOR="never"
+        shift
+        ;;
+      --progress)
+        require_option_value "$1" "${2:-}"
+        CAT_PROGRESS="$2"
+        shift 2
+        ;;
+      --progress=*)
+        CAT_PROGRESS="${1#*=}"
+        shift
+        ;;
+      --progress-mode)
+        require_option_value "$1" "${2:-}"
+        CAT_PROGRESS_MODE="$2"
+        shift 2
+        ;;
+      --progress-mode=*)
+        CAT_PROGRESS_MODE="${1#*=}"
+        shift
+        ;;
+      --progress-width)
+        require_option_value "$1" "${2:-}"
+        CAT_PROGRESS_WIDTH="$2"
+        shift 2
+        ;;
+      --progress-width=*)
+        CAT_PROGRESS_WIDTH="${1#*=}"
+        shift
+        ;;
+      --progress-step)
+        require_option_value "$1" "${2:-}"
+        CAT_PROGRESS_STEP="$2"
+        shift 2
+        ;;
+      --progress-step=*)
+        CAT_PROGRESS_STEP="${1#*=}"
+        shift
+        ;;
+      --progress-interval)
+        require_option_value "$1" "${2:-}"
+        CAT_PROGRESS_INTERVAL="$2"
+        shift 2
+        ;;
+      --progress-interval=*)
+        CAT_PROGRESS_INTERVAL="${1#*=}"
+        shift
+        ;;
+      --no-update-notify)
+        CAT_UPDATE_NOTIFY="never"
+        shift
+        ;;
+      --update-notify)
+        CAT_UPDATE_NOTIFY="always"
+        shift
+        ;;
+      --update-ttl)
+        require_option_value "$1" "${2:-}"
+        CAT_UPDATE_TTL="$2"
+        shift 2
+        ;;
+      --update-ttl=*)
+        CAT_UPDATE_TTL="${1#*=}"
+        shift
+        ;;
+      --proot-no-seccomp)
+        CAT_PROOT_NO_SECCOMP="always"
+        shift
+        ;;
+      --no-proot-no-seccomp)
+        CAT_PROOT_NO_SECCOMP="never"
+        shift
+        ;;
+      --proot-assume-new-seccomp)
+        CAT_PROOT_ASSUME_NEW_SECCOMP="always"
+        shift
+        ;;
+      --no-proot-assume-new-seccomp)
+        CAT_PROOT_ASSUME_NEW_SECCOMP="never"
+        shift
+        ;;
+      --keep-ld-preload)
+        CAT_PROOT_UNSET_LD_PRELOAD="never"
+        shift
+        ;;
+      --no-proot-fake-root)
+        CAT_PROOT_FAKE_ROOT="never"
+        shift
+        ;;
+      --proot-fake-root)
+        CAT_PROOT_FAKE_ROOT="always"
+        shift
+        ;;
+      --no-proot-link2symlink)
+        CAT_PROOT_LINK2SYMLINK="never"
+        shift
+        ;;
+      --proot-link2symlink)
+        CAT_PROOT_LINK2SYMLINK="always"
+        shift
+        ;;
+      --proot-tmp-dir)
+        require_option_value "$1" "${2:-}"
+        CAT_PROOT_TMP_DIR="$2"
+        shift 2
+        ;;
+      --proot-tmp-dir=*)
+        CAT_PROOT_TMP_DIR="${1#*=}"
+        shift
+        ;;
+      --plain)
+        CAT_COLOR="never"
+        CAT_PROGRESS="never"
+        shift
+        ;;
+      -*)
+        MAIN_ARGS=("$@")
+        return 0
+        ;;
+      *)
+        MAIN_ARGS=("$@")
+        return 0
+        ;;
+    esac
+  done
+}
+
+run_default_action() {
+  print_overview
+}
+
+usage() {
+  cat <<'EOF'
+catainer - customizable proot Linux containers for Termux
+
+Usage:
+  catainer [global options]
+  catainer [global options] setup
+  catainer [global options] sources
+  catainer releases DISTRO [--arch ARCH] [--mirror URL]
+  catainer flavors DISTRO [--release RELEASE] [--arch ARCH] [--mirror URL]
+  catainer create NAME [options]
+  catainer shell NAME [--user USER] [--workdir DIR] [--host-root] [-- COMMAND...]
+  catainer exec NAME [--user USER] [--workdir DIR] [--host-root] -- COMMAND...
+  catainer root-shell NAME [--user USER] [--workdir DIR] [-- COMMAND...]
+  catainer root-exec NAME [--user USER] [--workdir DIR] -- COMMAND...
+  catainer login NAME [--user USER] [--workdir DIR] [--host-root] [--method auto|runuser|su|login]
+  catainer link NAME [ALIAS] [--target DIR] [--force]
+  catainer upgrade NAME
+  catainer status
+  catainer ls
+  catainer inspect NAME
+  catainer compat NAME [show|android-safe|default]
+  catainer doctor [NAME] [--host-root] [--run-tests]
+  catainer mount NAME SOURCE:TARGET[:ro]
+  catainer env NAME KEY=VALUE
+  catainer args NAME ARG...
+  catainer set NAME KEY=VALUE
+  catainer backup NAME [OUTPUT.tar.gz]
+  catainer restore NAME ARCHIVE.tar.gz [--force]
+  catainer delete NAME [--force]
+  catainer updates [--refresh]
+  catainer self-update [--target PATH] [--force]
+  catainer self-install [TARGET]
+
+Global options:
+      --color auto|always|never
+      --no-color
+      --plain                  disable colors and progress
+      --progress auto|always|never
+      --progress-mode compact|bar
+      --progress-width N
+      --progress-step N
+      --progress-interval N
+      --no-update-notify       disable update notices
+      --update-notify          enable update notices
+      --update-ttl SECONDS     update notice cache lifetime
+      --proot-no-seccomp       force PROOT_NO_SECCOMP=1 for proot
+      --no-proot-no-seccomp    do not set PROOT_NO_SECCOMP
+      --proot-assume-new-seccomp
+                               force PROOT_ASSUME_NEW_SECCOMP=1 for proot
+      --no-proot-assume-new-seccomp
+                               do not set PROOT_ASSUME_NEW_SECCOMP
+      --keep-ld-preload        keep host LD_PRELOAD for proot
+      --no-proot-fake-root     omit proot -0 fake-root mode
+      --proot-fake-root        force proot -0 fake-root mode
+      --no-proot-link2symlink  omit proot --link2symlink
+      --proot-link2symlink     force proot --link2symlink
+      --proot-tmp-dir DIR      override proot temporary directory
+
+Create options:
+  -d, --distro NAME       distro name, e.g. ubuntu, fedora, archlinux, kali
+  -r, --release RELEASE   distro release (ubuntu: 24.04, alpine: latest-stable, debian: stable)
+  -a, --arch ARCH         rootfs architecture; defaults to device architecture
+      --url URL           custom rootfs archive URL, or override built-in URL
+      --sha256 SHA256     verify downloaded archive
+      --mirror URL        override distro mirror/base URL
+      --variant VARIANT   distro variant, e.g. debian slim
+      --hostname NAME     hostname inside the container
+  -u, --user USER         create/use default user instead of root
+  -m, --mount SPEC        add bind mount, e.g. /sdcard:/sdcard
+  -e, --env KEY=VALUE     add environment variable
+      --post-install FILE run host file inside the container after install
+      --no-default-mounts skip /sdcard, /storage, /termux, /host-home defaults
+      --select            force the release and variant picker
+      --no-select         skip picker and use defaults
+      --skip-deps         do not auto-install Termux packages
+  -f, --force             replace existing container
+
+Examples:
+  catainer
+  catainer status
+  catainer setup
+  catainer releases fedora
+  catainer flavors voidlinux
+  catainer create u24 --distro ubuntu --release 24.04 --user dev
+  catainer create slim --distro debian --release bookworm --variant slim
+  catainer create arch --distro archlinux
+  catainer create fedora --distro fedora --release 44 --variant default
+  catainer create alpine --distro alpine --mount /sdcard:/sdcard
+  catainer shell u24
+  catainer login u24
+  catainer link u24
+  catainer compat u24 android-safe
+  catainer doctor u24
+  catainer exec u24 -- apt-get update
+  catainer delete u24 --force
+  catainer updates
+  catainer self-update
+  catainer root-shell u24
+  catainer create mine --distro custom --url https://example/rootfs.tar.xz --sha256 SHA
+
+Compatibility aliases:
+  deps=setup, distros=sources, versions=releases, variants=flavors
+  install=create, enter=shell, run=exec, shortcut=link
+  list=ls, info=inspect, proot-arg=args, config=set
+  update=upgrade, remove=delete, check-update=updates
+
+Host-root mode:
+  --host-root, root-shell, and root-exec require a rooted device with su or tsu.
+  Host-root mode runs proot as real Android root and disables proot fake-root (-0).
+EOF
+}
+
+ensure_dirs() {
+  mkdir -p "$CONTAINERS_DIR" "$CACHE_DIR" "$TMP_DIR" "$SHARED_DIR"
+}
+
+has_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+is_termux() {
+  [[ -n "${PREFIX:-}" && "$PREFIX" == *"/com.termux/"* ]] || [[ -d "/data/data/com.termux/files/usr" ]]
+}
+
+pkg_install() {
+  if ! has_cmd pkg; then
+    die "missing required commands and Termux pkg was not found"
+  fi
+
+  note "installing Termux dependencies: $*"
+  pkg install -y "$@"
+}
+
+cmd_deps() {
+  if ! has_cmd pkg; then
+    die "Termux pkg was not found; install proot, tar, curl, ca-certificates, xz-utils, gzip, zstd, coreutils manually"
+  fi
+
+  pkg install -y proot tar curl ca-certificates xz-utils gzip zstd coreutils
+}
+
+ensure_runtime_deps() {
+  local skip_deps="${1:-0}"
+  local missing_packages=()
+
+  has_cmd proot || missing_packages+=("proot")
+  has_cmd tar || missing_packages+=("tar")
+  has_cmd curl || has_cmd wget || missing_packages+=("curl")
+  has_cmd sha256sum || missing_packages+=("coreutils")
+
+  if ((${#missing_packages[@]} == 0)); then
+    return 0
+  fi
+
+  if [[ "$skip_deps" == "1" ]]; then
+    die "missing dependencies; run: catainer setup"
+  fi
+
+  if is_termux && has_cmd pkg; then
+    pkg_install proot tar curl ca-certificates xz-utils gzip zstd coreutils
+  else
+    die "missing dependencies: ${missing_packages[*]}"
+  fi
+}
+
+fetch_stdout() {
+  local url="$1"
+
+  if has_cmd curl; then
+    curl -fsSL "$url"
+  elif has_cmd wget; then
+    wget -qO- "$url"
+  else
+    die "curl or wget is required"
+  fi
+}
+
+download_file() {
+  local url="$1"
+  local output="$2"
+  local partial="${output}.part"
+  local total=""
+  local bytes
+  local download_pid
+  local progress_pid=""
+  local status=0
+
+  rm -f "$partial"
+  total="$(content_length "$url" || true)"
+  if has_cmd curl; then
+    curl -fL -sS -o "$partial" "$url" &
+    download_pid=$!
+  elif has_cmd wget; then
+    wget -q -O "$partial" "$url" &
+    download_pid=$!
+  else
+    die "curl or wget is required"
+  fi
+
+  if progress_enabled; then
+    show_download_progress "$partial" "${total:-0}" "$download_pid" &
+    progress_pid=$!
+  fi
+
+  set +e
+  wait "$download_pid"
+  status=$?
+  set -e
+
+  if [[ -n "$progress_pid" ]]; then
+    wait "$progress_pid" 2>/dev/null || true
+  fi
+
+  if ((status != 0)); then
+    rm -f "$partial"
+    return "$status"
+  fi
+
+  mv "$partial" "$output"
+  bytes="$(wc -c <"$output" | tr -d '[:space:]')"
+  note "download complete: $(format_bytes "$bytes")"
+}
+
+content_length() {
+  local url="$1"
+  local length=""
+
+  if has_cmd curl; then
+    length="$(
+      curl -fsIL "$url" 2>/dev/null |
+        awk 'tolower($1) == "content-length:" { len = $2 } END { gsub("\r", "", len); if (len ~ /^[0-9]+$/) print len }'
+    )"
+  elif has_cmd wget; then
+    length="$(
+      wget --spider --server-response "$url" 2>&1 |
+        awk 'tolower($1) == "content-length:" { len = $2 } END { gsub("\r", "", len); if (len ~ /^[0-9]+$/) print len }'
+    )"
+  fi
+
+  printf '%s\n' "$length"
+}
+
+progress_enabled() {
+  case "${CAT_PROGRESS:-auto}" in
+    always) return 0 ;;
+    never) return 1 ;;
+    auto) [[ -t 2 ]] ;;
+    *) [[ -t 2 ]] ;;
+  esac
+}
+
+repeat_char() {
+  local char="$1"
+  local count="$2"
+
+  if ((count <= 0)); then
+    return 0
+  fi
+
+  printf '%*s' "$count" '' | tr ' ' "$char"
+}
+
+show_download_progress() {
+  local file="$1"
+  local total="${2:-0}"
+  local pid="$3"
+  local width="${CAT_PROGRESS_WIDTH:-30}"
+  local mode="${CAT_PROGRESS_MODE:-compact}"
+  local step="${CAT_PROGRESS_STEP:-10}"
+  local interval="${CAT_PROGRESS_INTERVAL:-5}"
+  local start
+  local now
+  local elapsed
+  local bytes
+  local speed
+  local percent
+  local filled
+  local empty
+  local eta
+  local line
+  local spin=0
+  local spinner='|/-\'
+  local spin_char
+  local last_line=""
+  local redraw=0
+  local next_percent=0
+  local next_elapsed=0
+
+  [[ "$width" =~ ^[0-9]+$ ]] || width=30
+  ((width >= 10)) || width=10
+  ((width <= 60)) || width=60
+  [[ "$step" =~ ^[0-9]+$ ]] || step=10
+  ((step >= 1)) || step=1
+  ((step <= 50)) || step=50
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=5
+  ((interval >= 1)) || interval=1
+  ((interval <= 60)) || interval=60
+
+  case "$mode" in
+    bar|redraw|single)
+      [[ -t 2 && "${TERM:-}" != "dumb" ]] && redraw=1
+      ;;
+    compact|line|lines|"")
+      redraw=0
+      ;;
+    *)
+      redraw=0
+      ;;
+  esac
+
+  start="$(date +%s)"
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 1
+    kill -0 "$pid" 2>/dev/null || break
+
+    bytes="$(progress_file_size "$file")"
+    now="$(date +%s)"
+    elapsed=$((now - start))
+    ((elapsed > 0)) || elapsed=1
+    speed=$((bytes / elapsed))
+
+    if ((total > 0)); then
+      percent=$((bytes * 100 / total))
+      ((percent > 100)) && percent=100
+      if ((redraw == 0 && percent >= 100)); then
+        continue
+      fi
+      if ((redraw == 0 && percent < next_percent && percent < 100)); then
+        continue
+      fi
+      next_percent=$((((percent / step) + 1) * step))
+      ((next_percent > 100)) && next_percent=100
+      filled=$((bytes * width / total))
+      ((filled > width)) && filled=$width
+      empty=$((width - filled))
+      eta="$(format_eta "$speed" "$((total - bytes))")"
+      line="$(printf 'Downloading [%s%s%s%s%s] %3d%% %s/%s %s/s ETA %s' \
+        "$C_GREEN" "$(repeat_char '#' "$filled")" "$C_DIM" "$(repeat_char '-' "$empty")" "$C_RESET" \
+        "$percent" "$(format_bytes "$bytes")" "$(format_bytes "$total")" "$(format_bytes "$speed")" "$eta")"
+    else
+      if ((redraw == 0 && elapsed < next_elapsed)); then
+        continue
+      fi
+      next_elapsed=$((elapsed + interval))
+      spin_char="${spinner:$((spin % ${#spinner})):1}"
+      line="$(printf 'Downloading [%s] %s %s/s' "$spin_char" "$(format_bytes "$bytes")" "$(format_bytes "$speed")")"
+      spin=$((spin + 1))
+    fi
+
+    if [[ "$line" != "$last_line" ]]; then
+      if ((redraw == 1)); then
+        printf '\r\033[2K%s' "$line" >&2
+      else
+        printf '%s\n' "$line" >&2
+      fi
+      last_line="$line"
+    fi
+  done
+
+  bytes="$(progress_file_size "$file")"
+  if ((total > 0)); then
+    line="$(printf 'Downloading [%s%s%s] 100%% %s/%s complete' \
+      "$C_GREEN" "$(repeat_char '#' "$width")" "$C_RESET" "$(format_bytes "$bytes")" "$(format_bytes "$total")")"
+  else
+    line="$(printf 'Downloading [done] %s complete' "$(format_bytes "$bytes")")"
+  fi
+  if ((redraw == 1)); then
+    printf '\r\033[2K%s\n' "$line" >&2
+  elif [[ "$line" != "$last_line" ]]; then
+    printf '%s\n' "$line" >&2
+  fi
+}
+
+progress_file_size() {
+  local file="$1"
+
+  if [[ -f "$file" ]]; then
+    wc -c <"$file" | tr -d '[:space:]'
+  else
+    printf '0'
+  fi
+}
+
+format_eta() {
+  local speed="${1:-0}"
+  local remaining="${2:-0}"
+  local seconds
+
+  if ((speed <= 0 || remaining <= 0)); then
+    printf '%s' '--'
+    return 0
+  fi
+
+  seconds=$((remaining / speed))
+  if ((seconds < 60)); then
+    printf '%ss' "$seconds"
+  elif ((seconds < 3600)); then
+    printf '%sm%02ss' "$((seconds / 60))" "$((seconds % 60))"
+  else
+    printf '%sh%02sm' "$((seconds / 3600))" "$(((seconds % 3600) / 60))"
+  fi
+}
+
+format_bytes() {
+  local bytes="${1:-0}"
+  awk -v bytes="$bytes" 'BEGIN {
+    split("B KB MB GB TB", unit, " ")
+    value = bytes + 0
+    idx = 1
+    while (value >= 1024 && idx < 5) {
+      value = value / 1024
+      idx++
+    }
+    if (idx == 1) {
+      printf "%d %s", value, unit[idx]
+    } else {
+      printf "%.1f %s", value, unit[idx]
+    }
+  }'
+}
+
+validate_name() {
+  local name="$1"
+
+  [[ "$name" =~ ^[A-Za-z0-9_.-]+$ ]] || die "invalid name '$name'; use letters, numbers, dot, underscore, or dash"
+}
+
+container_dir() {
+  printf '%s/%s\n' "$CONTAINERS_DIR" "$1"
+}
+
+config_path() {
+  printf '%s/config\n' "$(container_dir "$1")"
+}
+
+mounts_path() {
+  printf '%s/mounts\n' "$(container_dir "$1")"
+}
+
+env_path() {
+  printf '%s/env\n' "$(container_dir "$1")"
+}
+
+proot_args_path() {
+  printf '%s/proot-args\n' "$(container_dir "$1")"
+}
+
+rootfs_path() {
+  printf '%s/rootfs\n' "$(container_dir "$1")"
+}
+
+shell_quote() {
+  printf '%q' "$1"
+}
+
+print_argv() {
+  local first="1"
+  local arg
+
+  for arg in "$@"; do
+    [[ "$first" == "1" ]] || printf ' '
+    shell_quote "$arg"
+    first="0"
+  done
+  printf '\n'
+}
+
+write_config_value() {
+  local key="$1"
+  local value="$2"
+
+  printf '%s=' "$key"
+  shell_quote "$value"
+  printf '\n'
+}
+
+catainer_update_url() {
+  local repo="${CATAINER_REPO:-mewbleh/catainer}"
+  local branch="${CATAINER_BRANCH:-main}"
+
+  printf '%s\n' "${CATAINER_UPDATE_URL:-${CATAINER_INSTALL_URL:-https://raw.githubusercontent.com/${repo}/${branch}/catainer}}"
+}
+
+fetch_update_stdout() {
+  local url="$1"
+  local connect_timeout="${CAT_UPDATE_CONNECT_TIMEOUT:-3}"
+  local timeout="${CAT_UPDATE_TIMEOUT:-8}"
+
+  if has_cmd curl; then
+    curl -fsSL --connect-timeout "$connect_timeout" --max-time "$timeout" "$url"
+  elif has_cmd wget; then
+    wget -q -T "$timeout" -t 1 -O- "$url"
+  else
+    return 127
+  fi
+}
+
+extract_script_version() {
+  awk -F= '
+    /^VERSION=/ {
+      value = $2
+      gsub(/["[:space:]]/, "", value)
+      gsub(/\047/, "", value)
+      print value
+      exit
+    }
+  '
+}
+
+version_parts() {
+  local version="${1#v}"
+  local major minor patch rest
+
+  version="${version%%[-+]*}"
+  IFS=. read -r major minor patch rest <<<"$version"
+  [[ "$major" =~ ^[0-9]+$ ]] || major=0
+  [[ "$minor" =~ ^[0-9]+$ ]] || minor=0
+  [[ "$patch" =~ ^[0-9]+$ ]] || patch=0
+  printf '%s %s %s\n' "$major" "$minor" "$patch"
+}
+
+version_gt() {
+  local left="$1"
+  local right="$2"
+  local left_major left_minor left_patch
+  local right_major right_minor right_patch
+
+  read -r left_major left_minor left_patch < <(version_parts "$left")
+  read -r right_major right_minor right_patch < <(version_parts "$right")
+
+  ((left_major > right_major)) && return 0
+  ((left_major < right_major)) && return 1
+  ((left_minor > right_minor)) && return 0
+  ((left_minor < right_minor)) && return 1
+  ((left_patch > right_patch))
+}
+
+write_update_cache() {
+  local status="$1"
+  local latest_version="$2"
+  local url="$3"
+  local message="${4:-}"
+
+  ensure_dirs
+  {
+    write_config_value checked_at "$(date +%s)"
+    write_config_value status "$status"
+    write_config_value latest_version "$latest_version"
+    write_config_value url "$url"
+    write_config_value message "$message"
+  } >"$UPDATE_CACHE"
+}
+
+load_update_cache() {
+  checked_at=""
+  status=""
+  latest_version=""
+  url=""
+  message=""
+
+  [[ -f "$UPDATE_CACHE" ]] || return 1
+  # This cache is local state written by catainer.
+  # shellcheck source=/dev/null
+  source "$UPDATE_CACHE"
+  [[ -n "${checked_at:-}" && -n "${status:-}" ]] || return 1
+}
+
+update_cache_is_fresh() {
+  local ttl="${CAT_UPDATE_TTL:-86400}"
+  local now
+
+  [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=86400
+  ((ttl > 0)) || return 1
+  load_update_cache || return 1
+  now="$(date +%s)"
+  ((now - checked_at < ttl))
+}
+
+check_catainer_update() {
+  local url
+  local script
+  local remote_version
+  local update_status
+
+  url="$(catainer_update_url)"
+  if ! script="$(fetch_update_stdout "$url" 2>/dev/null)"; then
+    write_update_cache error "" "$url" "could not fetch remote catainer"
+    return 1
+  fi
+
+  remote_version="$(printf '%s\n' "$script" | extract_script_version)"
+  if [[ -z "$remote_version" ]]; then
+    write_update_cache error "" "$url" "remote script did not expose VERSION"
+    return 1
+  fi
+
+  if version_gt "$remote_version" "$VERSION"; then
+    update_status="available"
+  else
+    update_status="current"
+  fi
+
+  write_update_cache "$update_status" "$remote_version" "$url" ""
+}
+
+load_config() {
+  local name="$1"
+  local config
+
+  validate_name "$name"
+  config="$(config_path "$name")"
+  [[ -f "$config" ]] || die "container '$name' does not exist"
+
+  # This file is owned by the local user and intentionally editable.
+  # shellcheck source=/dev/null
+  source "$config"
+
+  name="${name:-$1}"
+  distro="${distro:-unknown}"
+  release="${release:-unknown}"
+  variant="${variant:-$(default_variant "$distro" 2>/dev/null || printf default)}"
+  arch="${arch:-unknown}"
+  hostname="${hostname:-$name}"
+  default_user="${default_user:-root}"
+  proot_fake_root="${proot_fake_root:-auto}"
+  proot_link2symlink="${proot_link2symlink:-auto}"
+}
+
+normalize_distro() {
+  local distro="${1,,}"
+
+  case "$distro" in
+    arch|arch-linux) printf 'archlinux\n' ;;
+    alma|alma-linux) printf 'almalinux\n' ;;
+    rocky|rocky-linux) printf 'rockylinux\n' ;;
+    opensuse-tumbleweed|suse) printf 'opensuse\n' ;;
+    void|void-linux) printf 'voidlinux\n' ;;
+    linuxmint|linux-mint) printf 'mint\n' ;;
+    oraclelinux|oracle-linux) printf 'oracle\n' ;;
+    *) printf '%s\n' "$distro" ;;
+  esac
+}
+
+is_lxc_distro() {
+  case "$1" in
+    almalinux|archlinux|busybox|devuan|fedora|kali|mint|nixos|opensuse|oracle|rockylinux|voidlinux)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+detect_arch() {
+  local distro="$1"
+  local machine
+
+  distro="$(normalize_distro "$distro")"
+  machine="$(uname -m)"
+  case "$distro:$machine" in
+    alpine:aarch64|alpine:arm64) printf 'aarch64\n'; return 0 ;;
+    alpine:armv7l|alpine:armv8l) printf 'armv7\n'; return 0 ;;
+    alpine:i686|alpine:x86) printf 'x86\n'; return 0 ;;
+    alpine:x86_64|alpine:amd64) printf 'x86_64\n'; return 0 ;;
+    ubuntu:aarch64|ubuntu:arm64) printf 'arm64\n'; return 0 ;;
+    ubuntu:armv7l|ubuntu:armv8l) printf 'armhf\n'; return 0 ;;
+    ubuntu:x86_64|ubuntu:amd64) printf 'amd64\n'; return 0 ;;
+    debian:aarch64|debian:arm64) printf 'arm64v8\n'; return 0 ;;
+    debian:armv7l|debian:armv8l) printf 'arm32v7\n'; return 0 ;;
+    debian:i686|debian:x86) printf 'i386\n'; return 0 ;;
+    debian:x86_64|debian:amd64) printf 'amd64\n'; return 0 ;;
+    custom:aarch64|custom:arm64) printf 'arm64\n'; return 0 ;;
+    custom:armv7l|custom:armv8l) printf 'armhf\n'; return 0 ;;
+    custom:i686|custom:x86) printf 'i386\n'; return 0 ;;
+    custom:x86_64|custom:amd64) printf 'amd64\n'; return 0 ;;
+  esac
+
+  if is_lxc_distro "$distro"; then
+    case "$machine" in
+      aarch64|arm64) printf 'arm64\n' ;;
+      x86_64|amd64) printf 'amd64\n' ;;
+      riscv64) printf 'riscv64\n' ;;
+      armv7l|armv8l) printf 'armhf\n' ;;
+      i686|x86) printf 'i386\n' ;;
+      *) die "unsupported architecture '$machine' for distro '$distro'; pass --arch manually" ;;
+    esac
+    return 0
+  fi
+
+  case "$distro:$machine" in
+    *) die "unsupported architecture '$machine' for distro '$distro'; pass --arch manually" ;;
+  esac
+}
+
+default_release() {
+  case "$(normalize_distro "$1")" in
+    alpine) printf 'latest-stable\n' ;;
+    ubuntu) printf '24.04\n' ;;
+    debian) printf 'stable\n' ;;
+    almalinux) printf '9\n' ;;
+    archlinux) printf 'current\n' ;;
+    busybox) printf '1.38.0\n' ;;
+    devuan) printf 'daedalus\n' ;;
+    fedora) printf '44\n' ;;
+    kali) printf 'current\n' ;;
+    mint) printf 'zena\n' ;;
+    nixos) printf 'unstable\n' ;;
+    opensuse) printf 'tumbleweed\n' ;;
+    oracle) printf '9\n' ;;
+    rockylinux) printf '9\n' ;;
+    voidlinux) printf 'current\n' ;;
+    custom) printf 'custom\n' ;;
+    *) die "unsupported distro '$1'" ;;
+  esac
+}
+
+default_variant() {
+  local distro
+
+  distro="$(normalize_distro "$1")"
+  case "$distro" in
+    alpine) printf 'minirootfs\n' ;;
+    ubuntu) printf 'base\n' ;;
+    debian) printf 'default\n' ;;
+    custom) printf 'custom\n' ;;
+    *)
+      if is_lxc_distro "$distro"; then
+        printf 'default\n'
+      else
+        die "unsupported distro '$1'"
+      fi
+      ;;
+  esac
+}
+
+normalize_variant() {
+  local distro="$1"
+  local variant="${2:-}"
+
+  variant="${variant:-$(default_variant "$distro")}"
+  variant="${variant,,}"
+
+  distro="$(normalize_distro "$distro")"
+  case "$distro:$variant" in
+    alpine:minirootfs|alpine:default) printf 'minirootfs\n' ;;
+    ubuntu:base|ubuntu:default) printf 'base\n' ;;
+    debian:default|debian:rootfs|debian:full) printf 'default\n' ;;
+    debian:slim) printf 'slim\n' ;;
+    custom:custom|custom:default) printf 'custom\n' ;;
+    *)
+      if is_lxc_distro "$distro" && [[ "$variant" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        printf '%s\n' "$variant"
+      else
+        die "unsupported variant '$variant' for distro '$distro'"
+      fi
+      ;;
+  esac
+}
+
+version_sort_desc() {
+  if sort -Vr </dev/null >/dev/null 2>&1; then
+    sort -Vr
+  else
+    sort -r
+  fi
+}
+
+list_ubuntu_releases() {
+  local mirror="${1:-https://cdimage.ubuntu.com}"
+
+  fetch_stdout "${mirror%/}/ubuntu-base/releases/" |
+    sed -nE 's/.*href="([0-9]{2}\.[0-9]{2})\/".*/\1/p' |
+    version_sort_desc
+}
+
+list_alpine_releases() {
+  local mirror="${1:-https://dl-cdn.alpinelinux.org/alpine}"
+
+  printf 'latest-stable\n'
+  fetch_stdout "${mirror%/}/" |
+    sed -nE 's/.*href="(v[0-9]+\.[0-9]+)\/".*/\1/p' |
+    version_sort_desc
+}
+
+list_debian_releases() {
+  local arch="$1"
+
+  fetch_stdout "https://api.github.com/repos/debuerreotype/docker-debian-artifacts/git/trees/dist-${arch}?recursive=0" |
+    awk -F'"' '
+      /"path":/ { path = $4 }
+      /"type": "tree"/ && path !~ /\// && path != "" {
+        print path
+        path = ""
+      }
+    ' |
+    version_sort_desc
+}
+
+list_lxc_releases() {
+  local distro="$1"
+  local mirror="${2:-https://images.linuxcontainers.org}"
+
+  fetch_stdout "${mirror%/}/images/${distro}/" |
+    sed -nE 's/.*href="([^"]+)\/".*/\1/p' |
+    grep -Ev '^\.\.$' |
+    version_sort_desc
+}
+
+list_lxc_variants() {
+  local distro="$1"
+  local release="$2"
+  local arch="$3"
+  local mirror="${4:-https://images.linuxcontainers.org}"
+
+  fetch_stdout "${mirror%/}/images/${distro}/${release}/${arch}/" |
+    sed -nE 's/.*href="([^"]+)\/".*/\1/p' |
+    grep -Ev '^\.\.$' |
+    sort
+}
+
+list_distro_releases() {
+  local distro="$1"
+  local arch="$2"
+  local mirror="${3:-}"
+
+  distro="$(normalize_distro "$distro")"
+  case "$distro" in
+    alpine) list_alpine_releases "$mirror" ;;
+    ubuntu) list_ubuntu_releases "$mirror" ;;
+    debian) list_debian_releases "$arch" ;;
+    custom) printf 'custom\n' ;;
+    *)
+      if is_lxc_distro "$distro"; then
+        list_lxc_releases "$distro" "$mirror"
+      else
+        die "unsupported distro '$distro'"
+      fi
+      ;;
+  esac
+}
+
+list_distro_variants() {
+  local distro="$1"
+  local release="${2:-}"
+  local arch="${3:-}"
+  local mirror="${4:-}"
+
+  distro="$(normalize_distro "$distro")"
+  case "$distro" in
+    alpine) printf 'minirootfs\n' ;;
+    ubuntu) printf 'base\n' ;;
+    debian)
+      printf 'default\n'
+      printf 'slim\n'
+      ;;
+    custom) printf 'custom\n' ;;
+    *)
+      if is_lxc_distro "$distro"; then
+        release="${release:-$(default_release "$distro")}"
+        arch="${arch:-$(detect_arch "$distro")}"
+        list_lxc_variants "$distro" "$release" "$arch" "$mirror"
+      else
+        die "unsupported distro '$distro'"
+      fi
+      ;;
+  esac
+}
+
+can_prompt() {
+  [[ -t 0 && -t 1 && "${CAT_ASSUME_YES:-0}" != "1" ]]
+}
+
+array_contains() {
+  local needle="$1"
+  shift
+  local item
+
+  for item in "$@"; do
+    [[ "$item" == "$needle" ]] && return 0
+  done
+
+  return 1
+}
+
+choose_from_list() {
+  local title="$1"
+  local default="$2"
+  shift 2
+  local items=("$@")
+  local index
+  local answer
+
+  ((${#items[@]} > 0)) || {
+    printf '%s\n' "$default"
+    return 0
+  }
+
+  if ! array_contains "$default" "${items[@]}"; then
+    items=("$default" "${items[@]}")
+  fi
+
+  printf '%b%s%b\n' "$C_BOLD" "$title" "$C_RESET" >&2
+  for index in "${!items[@]}"; do
+    if [[ "${items[$index]}" == "$default" ]]; then
+      printf '  %b%2d%b) %s %b(default)%b\n' "$C_YELLOW" "$((index + 1))" "$C_RESET" "${items[$index]}" "$C_DIM" "$C_RESET" >&2
+    else
+      printf '  %b%2d%b) %s\n' "$C_YELLOW" "$((index + 1))" "$C_RESET" "${items[$index]}" >&2
+    fi
+  done
+
+  printf 'Choose [1-%d, enter for %s]: ' "${#items[@]}" "$default" >&2
+  read -r answer
+
+  if [[ -z "$answer" ]]; then
+    printf '%s\n' "$default"
+  elif [[ "$answer" =~ ^[0-9]+$ && "$answer" -ge 1 && "$answer" -le "${#items[@]}" ]]; then
+    printf '%s\n' "${items[$((answer - 1))]}"
+  else
+    die "invalid selection '$answer'"
+  fi
+}
+
+choose_release_if_needed() {
+  local distro="$1"
+  local arch="$2"
+  local mirror="$3"
+  local requested_release="$4"
+  local select_mode="$5"
+  local default
+  local releases=()
+
+  [[ -n "$requested_release" ]] && {
+    printf '%s\n' "$requested_release"
+    return 0
+  }
+
+  default="$(default_release "$distro")"
+  if [[ "$select_mode" == "never" || "$distro" == "custom" ]]; then
+    printf '%s\n' "$default"
+    return 0
+  fi
+
+  if [[ "$select_mode" == "always" || ( "$select_mode" == "auto" && can_prompt ) ]]; then
+    if mapfile -t releases < <(list_distro_releases "$distro" "$arch" "$mirror" 2>/dev/null); then
+      choose_from_list "Available ${distro} releases for ${arch}" "$default" "${releases[@]}"
+      return 0
+    fi
+
+    warn "could not load release list; using default '$default'"
+  fi
+
+  printf '%s\n' "$default"
+}
+
+choose_variant_if_needed() {
+  local distro="$1"
+  local release="$2"
+  local arch="$3"
+  local mirror="$4"
+  local requested_variant="$5"
+  local select_mode="$6"
+  local default
+  local variants=()
+
+  default="$(default_variant "$distro")"
+  if [[ -n "$requested_variant" ]]; then
+    normalize_variant "$distro" "$requested_variant"
+    return 0
+  fi
+
+  if [[ "$select_mode" == "never" || "$distro" == "custom" ]]; then
+    normalize_variant "$distro" "$default"
+    return 0
+  fi
+
+  if ! mapfile -t variants < <(list_distro_variants "$distro" "$release" "$arch" "$mirror" 2>/dev/null); then
+    variants=("$default")
+  fi
+  if ((${#variants[@]} > 1)) && [[ "$select_mode" == "always" || ( "$select_mode" == "auto" && can_prompt ) ]]; then
+    normalize_variant "$distro" "$(choose_from_list "Available ${distro} variants" "$default" "${variants[@]}")"
+    return 0
+  fi
+
+  normalize_variant "$distro" "$default"
+}
+
+cmd_distros() {
+  cat <<'EOF'
+Supported distro sources:
+  ubuntu      Ubuntu Base rootfs from cdimage.ubuntu.com
+  alpine      Alpine minirootfs from dl-cdn.alpinelinux.org
+  debian      Debian debuerreotype OCI rootfs artifacts
+  archlinux   Arch Linux from images.linuxcontainers.org
+  fedora      Fedora from images.linuxcontainers.org
+  kali        Kali Linux from images.linuxcontainers.org
+  mint        Linux Mint from images.linuxcontainers.org
+  opensuse    openSUSE from images.linuxcontainers.org
+  rockylinux  Rocky Linux from images.linuxcontainers.org
+  almalinux   AlmaLinux from images.linuxcontainers.org
+  oracle      Oracle Linux from images.linuxcontainers.org
+  devuan      Devuan from images.linuxcontainers.org
+  nixos       NixOS from images.linuxcontainers.org
+  voidlinux   Void Linux from images.linuxcontainers.org
+  busybox     BusyBox from images.linuxcontainers.org
+  custom      Any tar rootfs URL passed with --url
+
+Supported archive formats depend on installed tar helpers: .tar, .tar.gz, .tar.xz, .tar.zst.
+Use `catainer releases DISTRO` and `catainer flavors DISTRO` to inspect choices.
+EOF
+}
+
+cmd_versions() {
+  local distro="${1:-}"
+  [[ -n "$distro" && "$distro" != -* ]] || die "usage: catainer releases DISTRO [--arch ARCH] [--mirror URL]"
+  shift
+
+  distro="$(normalize_distro "$distro")"
+  local arch=""
+  local mirror=""
+
+  while (($#)); do
+    case "$1" in
+      -a|--arch) arch="${2:-}"; shift 2 ;;
+      --mirror) mirror="${2:-}"; shift 2 ;;
+      *) die "unknown versions option: $1" ;;
+    esac
+  done
+
+  arch="${arch:-$(detect_arch "$distro")}"
+  printf '%b%s releases for %s%b\n' "$C_BOLD" "$distro" "$arch" "$C_RESET"
+  list_distro_releases "$distro" "$arch" "$mirror" | sed 's/^/  /'
+}
+
+cmd_variants() {
+  local distro="${1:-}"
+  [[ -n "$distro" && "$distro" != -* ]] || die "usage: catainer flavors DISTRO [--release RELEASE] [--arch ARCH] [--mirror URL]"
+  shift
+
+  distro="$(normalize_distro "$distro")"
+  local release=""
+  local arch=""
+  local mirror=""
+
+  while (($#)); do
+    case "$1" in
+      -r|--release) release="${2:-}"; shift 2 ;;
+      -a|--arch) arch="${2:-}"; shift 2 ;;
+      --mirror) mirror="${2:-}"; shift 2 ;;
+      *) die "unknown variants option: $1" ;;
+    esac
+  done
+
+  release="${release:-$(default_release "$distro")}"
+  arch="${arch:-$(detect_arch "$distro")}"
+  printf '%b%s variants for %s/%s%b\n' "$C_BOLD" "$distro" "$release" "$arch" "$C_RESET"
+  list_distro_variants "$distro" "$release" "$arch" "$mirror" | sed 's/^/  /'
+}
+
+resolve_alpine_url() {
+  local release="$1"
+  local arch="$2"
+  local mirror="${3:-https://dl-cdn.alpinelinux.org/alpine}"
+  local index_url="${mirror%/}/${release}/releases/${arch}/"
+  local file
+
+  note "resolving Alpine rootfs from $index_url"
+  file="$(
+    fetch_stdout "$index_url" |
+      sed -nE 's/.*href="(alpine-minirootfs-[0-9][^"]*-'${arch}'\.tar\.gz)".*/\1/p' |
+      sort -V |
+      tail -n 1
+  )"
+
+  [[ -n "$file" ]] || die "could not resolve Alpine rootfs for release '$release' arch '$arch'"
+  printf '%s%s\n' "$index_url" "$file"
+}
+
+resolve_ubuntu_url() {
+  local release="$1"
+  local arch="$2"
+  local mirror="${3:-https://cdimage.ubuntu.com}"
+  local index_url="${mirror%/}/ubuntu-base/releases/${release}/release/"
+  local file
+
+  note "resolving Ubuntu Base rootfs from $index_url"
+  file="$(
+    fetch_stdout "$index_url" |
+      sed -nE 's/.*href="(ubuntu-base-[0-9][^"]*-base-'${arch}'\.tar\.gz)".*/\1/p' |
+      sort -V |
+      tail -n 1
+  )"
+
+  [[ -n "$file" ]] || die "could not resolve Ubuntu Base rootfs for release '$release' arch '$arch'"
+  printf '%s%s\n' "$index_url" "$file"
+}
+
+resolve_debian_url() {
+  local release="$1"
+  local arch="$2"
+  local variant="$3"
+  local mirror="${4:-https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts}"
+
+  if [[ "$variant" == "slim" ]]; then
+    printf '%s/dist-%s/%s/slim/oci/blobs/rootfs.tar.gz\n' "${mirror%/}" "$arch" "$release"
+  else
+    printf '%s/dist-%s/%s/oci/blobs/rootfs.tar.gz\n' "${mirror%/}" "$arch" "$release"
+  fi
+}
+
+resolve_ubuntu_url_for_variant() {
+  local release="$1"
+  local arch="$2"
+  local variant="$3"
+  local mirror="$4"
+
+  [[ "$variant" == "base" ]] || die "unsupported Ubuntu variant '$variant'"
+  resolve_ubuntu_url "$release" "$arch" "$mirror"
+}
+
+resolve_alpine_url_for_variant() {
+  local release="$1"
+  local arch="$2"
+  local variant="$3"
+  local mirror="$4"
+
+  [[ "$variant" == "minirootfs" ]] || die "unsupported Alpine variant '$variant'"
+  resolve_alpine_url "$release" "$arch" "$mirror"
+}
+
+resolve_lxc_url() {
+  local distro="$1"
+  local release="$2"
+  local arch="$3"
+  local variant="$4"
+  local mirror="${5:-https://images.linuxcontainers.org}"
+  local index_url="${mirror%/}/images/${distro}/${release}/${arch}/${variant}/"
+  local build
+
+  note "resolving ${distro} rootfs from $index_url"
+  build="$(
+    fetch_stdout "$index_url" |
+      sed -nE 's/.*href="([^"]+)\/".*/\1/p' |
+      grep -Ev '^\.\.$' |
+      sort -V |
+      tail -n 1
+  )"
+
+  [[ -n "$build" ]] || die "could not resolve $distro rootfs for release '$release' variant '$variant' arch '$arch'"
+  printf '%s%s/rootfs.tar.xz\n' "$index_url" "$build"
+}
+
+resolve_rootfs_url() {
+  local distro="$1"
+  local release="$2"
+  local variant="$3"
+  local arch="$4"
+  local mirror="$5"
+
+  distro="$(normalize_distro "$distro")"
+  case "$distro" in
+    alpine) resolve_alpine_url_for_variant "$release" "$arch" "$variant" "$mirror" ;;
+    ubuntu) resolve_ubuntu_url_for_variant "$release" "$arch" "$variant" "$mirror" ;;
+    debian) resolve_debian_url "$release" "$arch" "$variant" "$mirror" ;;
+    custom) die "--url is required for custom distro installs" ;;
+    *)
+      if is_lxc_distro "$distro"; then
+        resolve_lxc_url "$distro" "$release" "$arch" "$variant" "$mirror"
+      else
+        die "unsupported distro '$distro'"
+      fi
+      ;;
+  esac
+}
+
+archive_name_from_url() {
+  local url="$1"
+  local name
+
+  name="${url%%\?*}"
+  name="${name##*/}"
+  [[ -n "$name" && "$name" != "/" ]] || name="rootfs.tar"
+  printf '%s\n' "$name"
+}
+
+cache_archive_path() {
+  local url="$1"
+  local name
+  local hash
+
+  name="$(archive_name_from_url "$url")"
+  hash="$(printf '%s' "$url" | sha256sum | awk '{print substr($1, 1, 12)}')"
+  printf '%s/%s-%s\n' "$CACHE_DIR" "$hash" "$name"
+}
+
+verify_archive() {
+  local archive="$1"
+  local sha256="$2"
+
+  [[ -n "$sha256" ]] || {
+    warn "no sha256 provided; downloaded archive was not verified"
+    return 0
+  }
+
+  printf '%s  %s\n' "$sha256" "$archive" | sha256sum -c -
+}
+
+tar_supports() {
+  local opt="$1"
+
+  tar --help 2>/dev/null | grep -q -- "$opt"
+}
+
+proot_env_prefix() {
+  local output_ref="$1"
+  local -n prefix_ref="$output_ref"
+  local no_seccomp="${CAT_PROOT_NO_SECCOMP:-auto}"
+  local assume_new_seccomp="${CAT_PROOT_ASSUME_NEW_SECCOMP:-auto}"
+  local unset_ld_preload="${CAT_PROOT_UNSET_LD_PRELOAD:-auto}"
+  local tmp_dir="${CAT_PROOT_TMP_DIR:-${PROOT_TMP_DIR:-${TMP_DIR}/proot}}"
+  local unset_args=()
+  local env_args=()
+
+  prefix_ref=(env)
+
+  case "$no_seccomp" in
+    auto|"")
+      if is_termux; then
+        env_args+=("PROOT_NO_SECCOMP=${PROOT_NO_SECCOMP:-1}")
+      elif [[ -n "${PROOT_NO_SECCOMP+x}" ]]; then
+        env_args+=("PROOT_NO_SECCOMP=$PROOT_NO_SECCOMP")
+      fi
+      ;;
+    always|yes|true|1)
+      env_args+=("PROOT_NO_SECCOMP=1")
+      ;;
+    never|no|false|0)
+      unset_args+=("-u" "PROOT_NO_SECCOMP")
+      ;;
+    *)
+      env_args+=("PROOT_NO_SECCOMP=$no_seccomp")
+      ;;
+  esac
+
+  case "$assume_new_seccomp" in
+    auto|"")
+      if is_termux; then
+        env_args+=("PROOT_ASSUME_NEW_SECCOMP=${PROOT_ASSUME_NEW_SECCOMP:-1}")
+      elif [[ -n "${PROOT_ASSUME_NEW_SECCOMP+x}" ]]; then
+        env_args+=("PROOT_ASSUME_NEW_SECCOMP=$PROOT_ASSUME_NEW_SECCOMP")
+      fi
+      ;;
+    always|yes|true|1)
+      env_args+=("PROOT_ASSUME_NEW_SECCOMP=1")
+      ;;
+    never|no|false|0)
+      unset_args+=("-u" "PROOT_ASSUME_NEW_SECCOMP")
+      ;;
+    *)
+      env_args+=("PROOT_ASSUME_NEW_SECCOMP=$assume_new_seccomp")
+      ;;
+  esac
+
+  case "$unset_ld_preload" in
+    auto|"")
+      if is_termux; then
+        unset_args+=("-u" "LD_PRELOAD")
+      fi
+      ;;
+    always|yes|true|1)
+      unset_args+=("-u" "LD_PRELOAD")
+      ;;
+    never|no|false|0)
+      if [[ -n "${LD_PRELOAD+x}" ]]; then
+        env_args+=("LD_PRELOAD=$LD_PRELOAD")
+      fi
+      ;;
+    *)
+      unset_args+=("-u" "LD_PRELOAD")
+      ;;
+  esac
+
+  if [[ -n "$tmp_dir" ]]; then
+    mkdir -p "$tmp_dir"
+    chmod 700 "$tmp_dir" 2>/dev/null || true
+    env_args+=("PROOT_TMP_DIR=$tmp_dir" "TMPDIR=$tmp_dir")
+  fi
+
+  prefix_ref+=("${unset_args[@]}" "${env_args[@]}")
+}
+
+proot_runner() {
+  local output_ref="$1"
+  shift
+  local -n runner_ref="$output_ref"
+  local proot_bin
+  local prefix=()
+
+  proot_bin="$(command -v proot || true)"
+  [[ -n "$proot_bin" ]] || return 1
+
+  proot_env_prefix prefix
+  runner_ref=("${prefix[@]}" "$proot_bin" "$@")
+}
+
+proot_link2symlink_available() {
+  local runner=()
+
+  proot_runner runner --link2symlink || return 1
+  "${runner[@]}" true >/dev/null 2>&1
+}
+
+reset_extract_dir() {
+  local rootfs="$1"
+
+  [[ -n "$rootfs" && "$rootfs" != "/" ]] || die "unsafe rootfs path for extraction"
+  rm -rf "$rootfs"
+  mkdir -p "$rootfs"
+}
+
+extract_archive_with() {
+  local archive="$1"
+  local rootfs="$2"
+  shift 2
+  local runner=("$@")
+  local tar_args=()
+  local cmd=()
+
+  tar_supports '--no-same-owner' && tar_args+=("--no-same-owner")
+  tar_supports '--delay-directory-restore' && tar_args+=("--delay-directory-restore")
+
+  case "$archive" in
+    *.tar.gz|*.tgz) cmd=(tar "${tar_args[@]}" -xzf "$archive" -C "$rootfs") ;;
+    *.tar.xz|*.txz) cmd=(tar "${tar_args[@]}" -xJf "$archive" -C "$rootfs") ;;
+    *.tar.zst|*.tzst) cmd=(tar "${tar_args[@]}" --zstd -xf "$archive" -C "$rootfs") ;;
+    *.tar) cmd=(tar "${tar_args[@]}" -xf "$archive" -C "$rootfs") ;;
+    *) cmd=(tar "${tar_args[@]}" -xaf "$archive" -C "$rootfs") ;;
+  esac
+
+  if ((${#runner[@]} > 0)); then
+    "${runner[@]}" "${cmd[@]}"
+  else
+    "${cmd[@]}"
+  fi
+}
+
+extract_archive() {
+  local archive="$1"
+  local rootfs="$2"
+  local tried_proot=0
+  local status=0
+  local proot_extract_runner=()
+
+  reset_extract_dir "$rootfs"
+
+  if is_termux && proot_link2symlink_enabled auto && proot_link2symlink_available; then
+    tried_proot=1
+    proot_runner proot_extract_runner --link2symlink || die "proot is required; run: catainer setup"
+    if extract_archive_with "$archive" "$rootfs" "${proot_extract_runner[@]}"; then
+      return 0
+    else
+      status=$?
+    fi
+    warn "proot-compatible extraction failed; retrying with plain tar"
+    reset_extract_dir "$rootfs"
+  fi
+
+  if extract_archive_with "$archive" "$rootfs"; then
+    return 0
+  else
+    status=$?
+  fi
+
+  if ((tried_proot == 0)) && proot_link2symlink_enabled auto && proot_link2symlink_available; then
+    warn "plain tar extraction failed; retrying with proot --link2symlink for Android hardlink compatibility"
+    reset_extract_dir "$rootfs"
+    proot_runner proot_extract_runner --link2symlink || die "proot is required; run: catainer setup"
+    extract_archive_with "$archive" "$rootfs" "${proot_extract_runner[@]}"
+    return $?
+  fi
+
+  return "$status"
+}
+
+normalize_rootfs_permissions() {
+  local rootfs="$1"
+  local path
+
+  for path in \
+    / \
+    /bin \
+    /sbin \
+    /usr \
+    /usr/bin \
+    /usr/sbin \
+    /usr/local \
+    /usr/local/bin \
+    /etc \
+    /dev \
+    /proc \
+    /sys \
+    /home \
+    /root; do
+    [[ -d "$rootfs$path" ]] && chmod u+rwx,go+rx "$rootfs$path" 2>/dev/null || true
+  done
+
+  [[ -d "$rootfs/tmp" ]] && chmod 1777 "$rootfs/tmp" 2>/dev/null || true
+
+  for path in \
+    /bin/sh \
+    /bin/bash \
+    /usr/bin/bash \
+    /bin/ash \
+    /bin/zsh \
+    /usr/bin/env \
+    /bin/su \
+    /usr/bin/su; do
+    [[ -f "$rootfs$path" ]] && chmod u+rwx,go+rx "$rootfs$path" 2>/dev/null || true
+  done
+}
+
+android_dns_servers() {
+  local dns
+
+  if has_cmd getprop; then
+    for dns in "$(getprop net.dns1 2>/dev/null || true)" "$(getprop net.dns2 2>/dev/null || true)"; do
+      [[ -n "$dns" ]] && printf 'nameserver %s\n' "$dns"
+    done
+  fi
+
+  printf 'nameserver 1.1.1.1\n'
+  printf 'nameserver 8.8.8.8\n'
+}
+
+ensure_file_parent() {
+  local path="$1"
+
+  mkdir -p "$(dirname "$path")"
+}
+
+write_guest_integration_files() {
+  local name="$1"
+  local rootfs="$2"
+  local distro="${3:-unknown}"
+  local release="${4:-unknown}"
+  local variant="${5:-default}"
+  local arch="${6:-unknown}"
+  local hostname="${7:-$name}"
+
+  mkdir -p "$rootfs/etc/profile.d" "$rootfs/usr/local/bin" || return 1
+
+  {
+    printf 'Welcome to %s %s (%s)\n' "$distro" "$release" "$name"
+    printf '\n'
+    printf 'Container: %s\n' "$name"
+    printf 'Distro:    %s\n' "$distro"
+    printf 'Release:   %s\n' "$release"
+    printf 'Variant:   %s\n' "$variant"
+    printf 'Arch:      %s\n' "$arch"
+    printf 'Hostname:  %s\n' "$hostname"
+    printf '\n'
+    printf 'Managed by catainer. Run catainer-info for these details again.\n'
+  } >"$rootfs/etc/catainer-motd" || return 1
+
+  {
+    printf 'export CATAINER_NAME=%s\n' "$name"
+    cat <<'EOF'
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export TERM="${TERM:-xterm-256color}"
+
+catainer_set_prompt() {
+  case "${CATAINER_PROMPT:-1}" in
+    0|false|no|off) return 0 ;;
+  esac
+
+  [ -z "${CATAINER_KEEP_PS1:-}" ] || return 0
+
+  if [ -n "${BASH_VERSION:-}" ]; then
+    PS1='\u@'"$CATAINER_NAME"':\w\$ '
+    export PS1
+  elif [ -n "${ZSH_VERSION:-}" ]; then
+    PS1='%n@'"$CATAINER_NAME"':%~%# '
+    export PS1
+  fi
+}
+
+case "$-" in
+  *i*)
+    if [ -z "${CATAINER_MOTD_SHOWN:-}" ] && [ -z "${MOTD_SHOWN:-}" ]; then
+      export CATAINER_MOTD_SHOWN=1
+      if command -v catainer-motd >/dev/null 2>&1; then
+        catainer-motd
+      elif [ -r /etc/catainer-motd ]; then
+        cat /etc/catainer-motd
+      fi
+    fi
+    catainer_set_prompt
+    ;;
+esac
+EOF
+  } >"$rootfs/etc/profile.d/catainer.sh" || return 1
+
+  cat >"$rootfs/usr/local/bin/catainer-motd" <<'EOF' || return 1
+#!/bin/sh
+root="${CATAINER_MOTD_ROOT:-}"
+shown=0
+
+show_file() {
+  file="${root}$1"
+  [ -f "$file" ] || [ -L "$file" ] || return 0
+  [ -r "$file" ] && [ -s "$file" ] || return 0
+  cat "$file"
+  shown=1
+}
+
+show_dir() {
+  dir="${root}$1"
+  [ -d "$dir" ] || return 0
+  for file in "$dir"/*; do
+    [ -f "$file" ] || [ -L "$file" ] || continue
+    [ -r "$file" ] && [ -s "$file" ] || continue
+    case "$(readlink "$file" 2>/dev/null || true)" in
+      /dev/null) continue ;;
+    esac
+    cat "$file"
+    shown=1
+  done
+}
+
+show_file /run/motd.dynamic
+show_file /etc/motd
+show_file /run/motd
+show_file /usr/lib/motd
+show_dir /etc/motd.d
+show_dir /run/motd.d
+show_dir /usr/lib/motd.d
+
+if [ "$shown" -eq 0 ]; then
+  show_file /etc/catainer-motd
+fi
+EOF
+  chmod +x "$rootfs/usr/local/bin/catainer-motd" || return 1
+
+  cat >"$rootfs/usr/local/bin/catainer-info" <<'EOF' || return 1
+#!/bin/sh
+if [ -r /etc/catainer-motd ]; then
+  cat /etc/catainer-motd
+else
+  printf 'catainer-info is not available in this rootfs\n' >&2
+  exit 1
+fi
+EOF
+  chmod +x "$rootfs/usr/local/bin/catainer-info" || return 1
+}
+
+configure_rootfs() {
+  local name="$1"
+  local rootfs="$2"
+  local distro="$3"
+  local release="$4"
+  local variant="$5"
+  local arch="$6"
+  local hostname="$7"
+
+  mkdir -p \
+    "$rootfs/dev" \
+    "$rootfs/proc" \
+    "$rootfs/sys" \
+    "$rootfs/tmp" \
+    "$rootfs/root" \
+    "$rootfs/home" \
+    "$rootfs/etc" \
+    "$rootfs/usr/local/bin"
+  chmod 1777 "$rootfs/tmp" 2>/dev/null || true
+
+  printf '%s\n' "$hostname" >"$rootfs/etc/hostname"
+  {
+    printf '127.0.0.1 localhost %s\n' "$hostname"
+    printf '::1 localhost ip6-localhost ip6-loopback\n'
+  } >"$rootfs/etc/hosts"
+
+  rm -f "$rootfs/etc/resolv.conf"
+  android_dns_servers >"$rootfs/etc/resolv.conf"
+
+  write_guest_integration_files "$name" "$rootfs" "$distro" "$release" "$variant" "$arch" "$hostname"
+
+  case "$distro" in
+    ubuntu|debian|kali|mint|devuan)
+      mkdir -p "$rootfs/usr/sbin" "$rootfs/etc/apt/apt.conf.d"
+      cat >"$rootfs/usr/sbin/policy-rc.d" <<'EOF'
+#!/bin/sh
+exit 101
+EOF
+      chmod +x "$rootfs/usr/sbin/policy-rc.d"
+      cat >"$rootfs/etc/apt/apt.conf.d/99catainer" <<'EOF'
+Acquire::Retries "3";
+APT::Install-Recommends "false";
+EOF
+      ;;
+    alpine)
+      mkdir -p "$rootfs/etc/apk"
+      ;;
+  esac
+
+}
+
+find_shell() {
+  local rootfs="$1"
+  local preferred="${2:-}"
+  local shell_path
+
+  for shell_path in "$preferred" /bin/bash /usr/bin/bash /bin/zsh /bin/ash /bin/sh; do
+    [[ -n "$shell_path" ]] || continue
+    if [[ -f "$rootfs$shell_path" ]]; then
+      printf '%s\n' "$shell_path"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+detect_shell() {
+  local rootfs="$1"
+  local preferred="${2:-}"
+
+  find_shell "$rootfs" "$preferred" && return 0
+  die "no usable shell found inside rootfs"
+}
+
+find_login() {
+  local rootfs="$1"
+  local login_path
+
+  for login_path in /bin/login /usr/bin/login; do
+    if [[ -f "$rootfs$login_path" ]]; then
+      printf '%s\n' "$login_path"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+find_runuser() {
+  local rootfs="$1"
+  local runuser_path
+
+  for runuser_path in /sbin/runuser /usr/sbin/runuser /bin/runuser /usr/bin/runuser; do
+    if [[ -f "$rootfs$runuser_path" ]]; then
+      printf '%s\n' "$runuser_path"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+find_su() {
+  local rootfs="$1"
+  local su_path
+
+  for su_path in /bin/su /usr/bin/su; do
+    if [[ -f "$rootfs$su_path" ]]; then
+      printf '%s\n' "$su_path"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+create_user() {
+  local rootfs="$1"
+  local user="$2"
+  local shell_path="$3"
+  local uid="${4:-1000}"
+  local gid="${5:-1000}"
+  local file
+  local tmp
+
+  [[ "$user" == "root" ]] && return 0
+  [[ "$user" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || die "invalid user '$user'"
+
+  mkdir -p "$rootfs/home/$user"
+
+  touch "$rootfs/etc/passwd" "$rootfs/etc/group"
+  if ! grep -qE "^${user}:" "$rootfs/etc/passwd"; then
+    printf '%s:x:%s:%s:%s:/home/%s:%s\n' "$user" "$uid" "$gid" "$user" "$user" "$shell_path" >>"$rootfs/etc/passwd"
+  fi
+
+  if ! grep -qE "^${user}:" "$rootfs/etc/group"; then
+    printf '%s:x:%s:\n' "$user" "$gid" >>"$rootfs/etc/group"
+  fi
+
+  if [[ -f "$rootfs/etc/shadow" ]] && ! grep -qE "^${user}:" "$rootfs/etc/shadow"; then
+    printf '%s:!:19000:0:99999:7:::\n' "$user" >>"$rootfs/etc/shadow"
+  fi
+
+  file="$rootfs/etc/group"
+  tmp="${file}.tmp"
+  if grep -qE '^sudo:' "$file"; then
+    awk -F: -v OFS=: -v group=sudo -v member="$user" '
+      $1 == group {
+        split($4, members, ",")
+        found = 0
+        for (i in members) {
+          if (members[i] == member) found = 1
+        }
+        if (!found) $4 = ($4 == "" ? member : $4 "," member)
+      }
+      { print }
+    ' "$file" >"$tmp" && mv "$tmp" "$file"
+  elif grep -qE '^wheel:' "$file"; then
+    awk -F: -v OFS=: -v group=wheel -v member="$user" '
+      $1 == group {
+        split($4, members, ",")
+        found = 0
+        for (i in members) {
+          if (members[i] == member) found = 1
+        }
+        if (!found) $4 = ($4 == "" ? member : $4 "," member)
+      }
+      { print }
+    ' "$file" >"$tmp" && mv "$tmp" "$file"
+  fi
+}
+
+write_default_files() {
+  local name="$1"
+  local no_default_mounts="$2"
+  shift 2
+  local mounts=("$@")
+  local dir
+
+  dir="$(container_dir "$name")"
+
+  : >"$dir/mounts"
+  if [[ "$no_default_mounts" != "1" ]]; then
+    [[ -d "$HOME" ]] && printf '%s:/host-home\n' "$HOME" >>"$dir/mounts"
+    [[ -d /sdcard ]] && printf '/sdcard:/sdcard\n' >>"$dir/mounts"
+    [[ -d /storage ]] && printf '/storage:/storage\n' >>"$dir/mounts"
+    [[ -n "${PREFIX:-}" && -d "${PREFIX:-}" ]] && printf '%s:/termux\n' "$PREFIX" >>"$dir/mounts"
+  fi
+
+  for mount_spec in "${mounts[@]}"; do
+    printf '%s\n' "$mount_spec" >>"$dir/mounts"
+  done
+
+  cat >"$dir/env" <<EOF
+TERM=${TERM:-xterm-256color}
+LANG=C.UTF-8
+LC_ALL=C.UTF-8
+EOF
+
+  : >"$dir/proot-args"
+}
+
+write_container_config() {
+  local name="$1"
+  local distro="$2"
+  local release="$3"
+  local variant="$4"
+  local arch="$5"
+  local url="$6"
+  local hostname="$7"
+  local default_user="$8"
+  local dir
+
+  dir="$(container_dir "$name")"
+  {
+    write_config_value name "$name"
+    write_config_value distro "$distro"
+    write_config_value release "$release"
+    write_config_value variant "$variant"
+    write_config_value arch "$arch"
+    write_config_value url "$url"
+    write_config_value hostname "$hostname"
+    write_config_value default_user "$default_user"
+    write_config_value proot_fake_root auto
+    write_config_value proot_link2symlink auto
+    write_config_value created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } >"$dir/config"
+}
+
+run_post_install() {
+  local name="$1"
+  local hook="$2"
+  local rootfs
+  local target
+
+  [[ -n "$hook" ]] || return 0
+  [[ -f "$hook" ]] || die "post-install file not found: $hook"
+
+  rootfs="$(rootfs_path "$name")"
+  target="/tmp/catainer-post-install.sh"
+  cp "$hook" "$rootfs$target"
+  chmod +x "$rootfs$target"
+  note "running post-install hook inside container"
+  exec_container "$name" root / 0 /bin/sh "$target"
+  rm -f "$rootfs$target"
+}
+
+cmd_install() {
+  local name="${1:-}"
+  [[ -n "$name" && "$name" != -* ]] || die "usage: catainer create NAME [options]"
+  shift
+
+  validate_name "$name"
+
+  local distro="ubuntu"
+  local release=""
+  local variant=""
+  local arch=""
+  local url=""
+  local sha256=""
+  local mirror=""
+  local hostname="$name"
+  local default_user="root"
+  local post_install=""
+  local skip_deps="0"
+  local force="0"
+  local no_default_mounts="0"
+  local select_mode="auto"
+  local mounts=()
+  local envs=()
+
+  while (($#)); do
+    case "$1" in
+      -d|--distro) distro="${2:-}"; shift 2 ;;
+      -r|--release) release="${2:-}"; shift 2 ;;
+      -a|--arch) arch="${2:-}"; shift 2 ;;
+      --url) url="${2:-}"; shift 2 ;;
+      --sha256) sha256="${2:-}"; shift 2 ;;
+      --mirror) mirror="${2:-}"; shift 2 ;;
+      --variant) variant="${2:-}"; shift 2 ;;
+      --hostname) hostname="${2:-}"; shift 2 ;;
+      -u|--user) default_user="${2:-}"; shift 2 ;;
+      -m|--mount) mounts+=("${2:-}"); shift 2 ;;
+      -e|--env) envs+=("${2:-}"); shift 2 ;;
+      --post-install) post_install="${2:-}"; shift 2 ;;
+      --no-default-mounts) no_default_mounts="1"; shift ;;
+      --select) select_mode="always"; shift ;;
+      --no-select|--yes) select_mode="never"; shift ;;
+      --skip-deps) skip_deps="1"; shift ;;
+      -f|--force) force="1"; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown install option: $1" ;;
+    esac
+  done
+
+  distro="$(normalize_distro "$distro")"
+  arch="${arch:-$(detect_arch "$distro")}"
+  if [[ -n "$url" ]]; then
+    release="${release:-$(default_release "$distro")}"
+    variant="$(normalize_variant "$distro" "${variant:-$(default_variant "$distro")}")"
+  else
+    release="$(choose_release_if_needed "$distro" "$arch" "$mirror" "$release" "$select_mode")"
+    variant="$(choose_variant_if_needed "$distro" "$release" "$arch" "$mirror" "$variant" "$select_mode")"
+  fi
+  hostname="${hostname:-$name}"
+
+  ensure_dirs
+  ensure_runtime_deps "$skip_deps"
+
+  local dir
+  local rootfs
+  dir="$(container_dir "$name")"
+  rootfs="$(rootfs_path "$name")"
+
+  if [[ -e "$dir" ]]; then
+    [[ "$force" == "1" ]] || die "container '$name' already exists; pass --force to replace"
+    rm -rf "$dir"
+  fi
+
+  if [[ -z "$url" ]]; then
+    url="$(resolve_rootfs_url "$distro" "$release" "$variant" "$arch" "$mirror")"
+  fi
+
+  local archive
+  archive="$(cache_archive_path "$url")"
+
+  mkdir -p "$dir"
+
+  if [[ ! -f "$archive" ]]; then
+    note "downloading $url"
+    download_file "$url" "$archive"
+  else
+    note "using cached archive $archive"
+  fi
+
+  verify_archive "$archive" "$sha256"
+
+  note "extracting rootfs"
+  extract_archive "$archive" "$rootfs"
+
+  configure_rootfs "$name" "$rootfs" "$distro" "$release" "$variant" "$arch" "$hostname"
+  normalize_rootfs_permissions "$rootfs"
+
+  local shell_path
+  shell_path="$(detect_shell "$rootfs")"
+  create_user "$rootfs" "$default_user" "$shell_path"
+
+  write_container_config "$name" "$distro" "$release" "$variant" "$arch" "$url" "$hostname" "$default_user"
+  write_default_files "$name" "$no_default_mounts" "${mounts[@]}"
+
+  for env_spec in "${envs[@]}"; do
+    validate_env_spec "$env_spec"
+    printf '%s\n' "$env_spec" >>"$(env_path "$name")"
+  done
+
+  run_post_install "$name" "$post_install"
+
+  note "installed container '$name'"
+  note "enter with: catainer shell $name"
+}
+
+is_blank_or_comment() {
+  local line="$1"
+  [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]]
+}
+
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s\n' "$value"
+}
+
+validate_env_spec() {
+  local spec="$1"
+  [[ "$spec" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || die "invalid env spec '$spec'; expected KEY=VALUE"
+}
+
+read_envs() {
+  local name="$1"
+  local user="$2"
+  local home_dir="$3"
+  local shell_path="$4"
+  local env_file
+  local line
+
+  env_file="$(env_path "$name")"
+  printf '%s\0' \
+    "HOME=$home_dir" \
+    "USER=$user" \
+    "LOGNAME=$user" \
+    "SHELL=$shell_path" \
+    "PATH=$DEFAULT_PATH" \
+    "HOSTNAME=${hostname:-$name}"
+
+  [[ -f "$env_file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(trim "$line")"
+    is_blank_or_comment "$line" && continue
+    validate_env_spec "$line"
+    printf '%s\0' "$line"
+  done <"$env_file"
+}
+
+bind_if_exists() {
+  local src="$1"
+  local dst="${2:-$1}"
+  local -n bind_args_ref="$3"
+
+  [[ -e "$src" ]] || return 0
+  bind_args_ref+=("-b" "${src}:${dst}")
+}
+
+read_mounts() {
+  local name="$1"
+  local rootfs="$2"
+  local -n mount_args_ref="$3"
+  local file
+  local line
+  local src
+  local dst
+  local mode
+
+  file="$(mounts_path "$name")"
+  [[ -f "$file" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(trim "$line")"
+    is_blank_or_comment "$line" && continue
+
+    IFS=':' read -r src dst mode <<<"$line"
+    [[ -n "${src:-}" && -n "${dst:-}" ]] || {
+      warn "skipping invalid mount spec: $line"
+      continue
+    }
+
+    if [[ "${mode:-}" == "ro" ]]; then
+      warn "read-only mount marker ignored by proot for $line"
+    fi
+
+    if [[ ! -e "$src" ]]; then
+      warn "skipping missing mount source: $src"
+      continue
+    fi
+
+    if [[ -d "$src" ]]; then
+      mkdir -p "$rootfs$dst"
+    else
+      ensure_file_parent "$rootfs$dst"
+      : >"$rootfs$dst" 2>/dev/null || true
+    fi
+
+    mount_args_ref+=("-b" "${src}:${dst}")
+  done <"$file"
+}
+
+read_extra_proot_args() {
+  local name="$1"
+  local -n extra_args_ref="$2"
+  local file
+  local line
+
+  file="$(proot_args_path "$name")"
+  [[ -f "$file" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(trim "$line")"
+    is_blank_or_comment "$line" && continue
+    extra_args_ref+=("$line")
+  done <"$file"
+}
+
+proot_link2symlink_enabled() {
+  local default="${1:-auto}"
+
+  case "${CAT_PROOT_LINK2SYMLINK:-$default}" in
+    never|no|false|0) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+proot_fake_root_enabled() {
+  local host_root="$1"
+  local default="${2:-auto}"
+
+  [[ "$host_root" == "1" ]] && return 1
+  case "${CAT_PROOT_FAKE_ROOT:-$default}" in
+    never|no|false|0) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+build_proot_args() {
+  local name="$1"
+  local rootfs="$2"
+  local workdir="$3"
+  local host_root="$4"
+  local output_ref="$5"
+  local -n proot_args_ref="$output_ref"
+
+  proot_args_ref=()
+  proot_link2symlink_enabled "${proot_link2symlink:-auto}" && proot_args_ref+=("--link2symlink")
+  proot_fake_root_enabled "$host_root" "${proot_fake_root:-auto}" && proot_args_ref+=("-0")
+  proot_args_ref+=("-r" "$rootfs")
+
+  mkdir -p "$rootfs/dev" "$rootfs/proc" "$rootfs/sys"
+  bind_if_exists /dev /dev "$output_ref"
+  bind_if_exists /proc /proc "$output_ref"
+  bind_if_exists /sys /sys "$output_ref"
+  bind_if_exists /system /system "$output_ref"
+  bind_if_exists /apex /apex "$output_ref"
+
+  read_mounts "$name" "$rootfs" "$output_ref"
+  read_extra_proot_args "$name" "$output_ref"
+
+  proot_args_ref+=("-w" "$workdir")
+}
+
+join_shell_command() {
+  local out=""
+  local arg
+  local escaped
+
+  for arg in "$@"; do
+    escaped="${arg//\'/\'\\\'\'}"
+    out+="${out:+ }'${escaped}'"
+  done
+
+  printf '%s\n' "$out"
+}
+
+find_host_su() {
+  local candidate
+
+  for candidate in tsu su; do
+    if has_cmd "$candidate"; then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+script_path() {
+  if has_cmd readlink; then
+    readlink -f "$0" 2>/dev/null && return 0
+  fi
+
+  printf '%s\n' "$0"
+}
+
+ensure_host_root() {
+  local enabled="$1"
+  [[ "$enabled" == "1" ]] || return 0
+
+  if [[ "$(id -u 2>/dev/null || printf 1)" == "0" ]]; then
+    export CAT_HOST_ROOT_ACTIVE=1
+    return 0
+  fi
+
+  if [[ "${CAT_HOST_ROOT_ACTIVE:-0}" == "1" ]]; then
+    die "host-root re-exec did not become uid 0"
+  fi
+
+  local su_bin
+  su_bin="$(find_host_su || true)"
+  [[ -n "$su_bin" ]] || die "host-root mode needs a rooted device with su or tsu"
+
+  local reexec=(
+    env
+    "CAT_HOST_ROOT_ACTIVE=1"
+    "CAT_HOME=$CAT_HOME"
+    "PATH=$PATH"
+    "HOME=$HOME"
+  )
+
+  if [[ -n "${PREFIX:-}" ]]; then
+    reexec+=("PREFIX=$PREFIX")
+  fi
+
+  reexec+=("$(script_path)" "${ORIGINAL_ARGS[@]}")
+
+  note "requesting Android root through $su_bin"
+  exec "$su_bin" -c "$(join_shell_command "${reexec[@]}")"
+}
+
+exec_container() {
+  local requested_name="$1"
+  local requested_user="$2"
+  local requested_workdir="$3"
+  local requested_host_root="${4:-0}"
+  shift 4
+
+  load_config "$requested_name"
+
+  local rootfs
+  rootfs="$(rootfs_path "$requested_name")"
+  [[ -d "$rootfs" ]] || die "rootfs missing for container '$requested_name'"
+  if ! write_guest_integration_files "$requested_name" "$rootfs" "$distro" "$release" "$variant" "$arch" "$hostname"; then
+    warn "could not refresh guest banner files for '$requested_name'"
+  fi
+  local proot_bin
+  proot_bin="$(command -v proot || true)"
+  [[ -n "$proot_bin" ]] || die "proot is required; run: catainer setup"
+  local proot_env=()
+  proot_env_prefix proot_env
+
+  local user="${requested_user:-$default_user}"
+  local home_dir="/root"
+  local workdir="$requested_workdir"
+  local shell_path
+
+  if [[ "$user" != "root" ]]; then
+    home_dir="/home/$user"
+  fi
+
+  shell_path="$(detect_shell "$rootfs")"
+  [[ -n "$workdir" ]] || workdir="$home_dir"
+
+  local proot_args=()
+  build_proot_args "$requested_name" "$rootfs" "$workdir" "$requested_host_root" proot_args
+
+  local envs=()
+  local env_entry
+  while IFS= read -r -d '' env_entry; do
+    envs+=("$env_entry")
+  done < <(read_envs "$requested_name" "$user" "$home_dir" "$shell_path")
+
+  local cmd=("$@")
+  local command_text=""
+  if ((${#cmd[@]} > 0)); then
+    command_text="$(join_shell_command "${cmd[@]}")"
+  fi
+
+  local clean_env_prefix=()
+  clean_env_prefix=("${proot_env[@]}" "${envs[@]}" "$proot_bin" "${proot_args[@]}")
+
+  if [[ "$user" == "root" ]]; then
+    if ((${#cmd[@]} > 0)); then
+      "${clean_env_prefix[@]}" "$shell_path" -lc "$command_text"
+    else
+      "${clean_env_prefix[@]}" "$shell_path" -l
+    fi
+    return $?
+  fi
+
+  local su_path=""
+  for candidate in /bin/su /usr/bin/su; do
+    if [[ -x "$rootfs$candidate" ]]; then
+      su_path="$candidate"
+      break
+    fi
+  done
+
+  if [[ -z "$su_path" ]]; then
+    warn "su not found; entering as fake root with USER=$user"
+    if ((${#cmd[@]} > 0)); then
+      "${clean_env_prefix[@]}" "$shell_path" -lc "$command_text"
+    else
+      "${clean_env_prefix[@]}" "$shell_path" -l
+    fi
+    return $?
+  fi
+
+  if ((${#cmd[@]} > 0)); then
+    "${clean_env_prefix[@]}" "$su_path" - "$user" -c "$command_text"
+  else
+    "${clean_env_prefix[@]}" "$su_path" - "$user"
+  fi
+}
+
+exec_login_container() {
+  local requested_name="$1"
+  local requested_user="$2"
+  local requested_workdir="$3"
+  local requested_host_root="${4:-0}"
+  local requested_method="${5:-auto}"
+
+  load_config "$requested_name"
+
+  local rootfs
+  rootfs="$(rootfs_path "$requested_name")"
+  [[ -d "$rootfs" ]] || die "rootfs missing for container '$requested_name'"
+  if ! write_guest_integration_files "$requested_name" "$rootfs" "$distro" "$release" "$variant" "$arch" "$hostname"; then
+    warn "could not refresh guest banner files for '$requested_name'"
+  fi
+
+  local proot_bin
+  proot_bin="$(command -v proot || true)"
+  [[ -n "$proot_bin" ]] || die "proot is required; run: catainer setup"
+  local proot_env=()
+  proot_env_prefix proot_env
+
+  local user="${requested_user:-$default_user}"
+  local home_dir="/root"
+  local workdir="$requested_workdir"
+  local shell_path
+
+  if [[ "$user" != "root" ]]; then
+    home_dir="/home/$user"
+  fi
+
+  shell_path="$(detect_shell "$rootfs")"
+  [[ -n "$workdir" ]] || workdir="$home_dir"
+
+  if ! proot_fake_root_enabled "$requested_host_root" "${proot_fake_root:-auto}"; then
+    warn "PAM/login session may fail because proot fake-root is disabled for '$requested_name'"
+  fi
+
+  local login_path=""
+  local runuser_path=""
+  local su_path=""
+  local method="$requested_method"
+  local selected_method=""
+  local session_cmd=()
+
+  case "$method" in
+    auto|pam|"") method="auto" ;;
+    runuser) ;;
+    su) ;;
+    login|bin-login|distro-login|raw-login|raw) method="login" ;;
+    *) die "unknown login method '$requested_method'; expected auto, runuser, su, or login" ;;
+  esac
+
+  case "$method" in
+    auto)
+      runuser_path="$(find_runuser "$rootfs" || true)"
+      su_path="$(find_su "$rootfs" || true)"
+      login_path="$(find_login "$rootfs" || true)"
+      if [[ -n "$runuser_path" ]]; then
+        selected_method="runuser"
+        session_cmd=("$runuser_path" -l "$user")
+      elif [[ -n "$su_path" ]]; then
+        selected_method="su"
+        session_cmd=("$su_path" - "$user")
+      elif [[ -n "$login_path" ]]; then
+        selected_method="login"
+        session_cmd=("$login_path" -f "$user")
+      else
+        die "no runuser, su, /bin/login, or /usr/bin/login found inside container '$requested_name'"
+      fi
+      ;;
+    runuser)
+      runuser_path="$(find_runuser "$rootfs" || true)"
+      [[ -n "$runuser_path" ]] || die "no runuser found inside container '$requested_name'"
+      selected_method="runuser"
+      session_cmd=("$runuser_path" -l "$user")
+      ;;
+    su)
+      su_path="$(find_su "$rootfs" || true)"
+      [[ -n "$su_path" ]] || die "no su found inside container '$requested_name'"
+      selected_method="su"
+      session_cmd=("$su_path" - "$user")
+      ;;
+    login)
+      login_path="$(find_login "$rootfs" || true)"
+      [[ -n "$login_path" ]] || die "no /bin/login or /usr/bin/login found inside container '$requested_name'"
+      selected_method="login"
+      session_cmd=("$login_path" -f "$user")
+      ;;
+  esac
+
+  local proot_args=()
+  build_proot_args "$requested_name" "$rootfs" "$workdir" "$requested_host_root" proot_args
+
+  local envs=()
+  local env_entry
+  while IFS= read -r -d '' env_entry; do
+    envs+=("$env_entry")
+  done < <(read_envs "$requested_name" "$user" "$home_dir" "$shell_path")
+
+  local clean_env_prefix=()
+  clean_env_prefix=("${proot_env[@]}" "${envs[@]}" "$proot_bin" "${proot_args[@]}")
+
+  warn "experimental PAM/login session using $selected_method; if it fails, use 'catainer shell $requested_name'"
+  if [[ "$selected_method" == "login" ]]; then
+    warn "raw /bin/login may wait for username/password and time out on some proot rootfs images"
+  fi
+  "${clean_env_prefix[@]}" "${session_cmd[@]}"
+}
+
+parse_exec_options() {
+  local -n out_name="$1"
+  local -n out_user="$2"
+  local -n out_workdir="$3"
+  local -n out_host_root="$4"
+  shift 4
+
+  out_name="${1:-}"
+  [[ -n "$out_name" && "$out_name" != -* ]] || die "container name is required"
+  shift
+
+  out_user=""
+  out_workdir=""
+  out_host_root="0"
+
+  while (($#)); do
+    case "$1" in
+      --user|-u) out_user="${2:-}"; shift 2 ;;
+      --workdir|-w) out_workdir="${2:-}"; shift 2 ;;
+      --host-root|--real-root|--root) out_host_root="1"; shift ;;
+      --) shift; break ;;
+      -*) die "unknown option: $1" ;;
+      *) break ;;
+    esac
+  done
+
+  EXEC_REMAINING=("$@")
+}
+
+cmd_enter() {
+  local name
+  local user
+  local workdir
+  local host_root
+  EXEC_REMAINING=()
+  parse_exec_options name user workdir host_root "$@"
+  ensure_host_root "$host_root"
+  exec_container "$name" "$user" "$workdir" "$host_root" "${EXEC_REMAINING[@]}"
+}
+
+cmd_run() {
+  local name
+  local user
+  local workdir
+  local host_root
+  EXEC_REMAINING=()
+  parse_exec_options name user workdir host_root "$@"
+  ((${#EXEC_REMAINING[@]} > 0)) || die "usage: catainer exec NAME [options] -- COMMAND..."
+  ensure_host_root "$host_root"
+  exec_container "$name" "$user" "$workdir" "$host_root" "${EXEC_REMAINING[@]}"
+}
+
+cmd_root_enter() {
+  local name
+  local user
+  local workdir
+  local host_root
+  EXEC_REMAINING=()
+  parse_exec_options name user workdir host_root "$@"
+  host_root="1"
+  ensure_host_root "$host_root"
+  exec_container "$name" "$user" "$workdir" "$host_root" "${EXEC_REMAINING[@]}"
+}
+
+cmd_root_run() {
+  local name
+  local user
+  local workdir
+  local host_root
+  EXEC_REMAINING=()
+  parse_exec_options name user workdir host_root "$@"
+  ((${#EXEC_REMAINING[@]} > 0)) || die "usage: catainer root-exec NAME [options] -- COMMAND..."
+  host_root="1"
+  ensure_host_root "$host_root"
+  exec_container "$name" "$user" "$workdir" "$host_root" "${EXEC_REMAINING[@]}"
+}
+
+cmd_login() {
+  local name=""
+  local user=""
+  local workdir=""
+  local host_root="0"
+  local method="auto"
+  EXEC_REMAINING=()
+
+  while (($#)); do
+    case "$1" in
+      --user|-u)
+        require_option_value "$1" "${2:-}"
+        user="$2"
+        shift 2
+        ;;
+      --user=*)
+        user="${1#*=}"
+        shift
+        ;;
+      --workdir|-w)
+        require_option_value "$1" "${2:-}"
+        workdir="$2"
+        shift 2
+        ;;
+      --workdir=*)
+        workdir="${1#*=}"
+        shift
+        ;;
+      --host-root|--real-root|--root)
+        host_root="1"
+        shift
+        ;;
+      --method|--login-method)
+        require_option_value "$1" "${2:-}"
+        method="$2"
+        shift 2
+        ;;
+      --method=*|--login-method=*)
+        method="${1#*=}"
+        shift
+        ;;
+      -h|--help)
+        cat <<'EOF'
+Usage:
+  catainer login NAME [--user USER] [--workdir DIR] [--host-root] [--method auto|runuser|su|login]
+
+Methods:
+  auto     prefer runuser, then su, then raw /bin/login
+  runuser  start a PAM session with runuser -l USER
+  su       start a login shell with su - USER
+  login    try raw /bin/login -f USER
+EOF
+        return 0
+        ;;
+      --)
+        shift
+        (($# == 0)) || die "catainer login does not accept a command; use: catainer exec NAME -- COMMAND..."
+        break
+        ;;
+      -*)
+        die "unknown login option: $1"
+        ;;
+      *)
+        if [[ -z "$name" ]]; then
+          name="$1"
+        else
+          die "usage: catainer login NAME [options]"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$name" ]] || die "usage: catainer login NAME [options]"
+  ensure_host_root "$host_root"
+  exec_login_container "$name" "$user" "$workdir" "$host_root" "$method"
+}
+
+default_shortcut_dir() {
+  if [[ -n "${PREFIX:-}" && -d "$PREFIX/bin" ]]; then
+    printf '%s\n' "$PREFIX/bin"
+  else
+    printf '%s\n' "$HOME/.local/bin"
+  fi
+}
+
+cmd_shortcut() {
+  local name=""
+  local alias=""
+  local target_dir=""
+  local force="0"
+
+  while (($#)); do
+    case "$1" in
+      --target)
+        require_option_value "$1" "${2:-}"
+        target_dir="$2"
+        shift 2
+        ;;
+      --target=*)
+        target_dir="${1#*=}"
+        shift
+        ;;
+      -f|--force)
+        force="1"
+        shift
+        ;;
+      -h|--help)
+        cat <<'EOF'
+Usage:
+  catainer link NAME [ALIAS] [--target DIR] [--force]
+
+Creates an executable launcher. With no arguments, the launcher enters the
+container. With arguments, it runs them inside the container.
+EOF
+        return 0
+        ;;
+      -*)
+        die "unknown link option: $1"
+        ;;
+      *)
+        if [[ -z "$name" ]]; then
+          name="$1"
+        elif [[ -z "$alias" ]]; then
+          alias="$1"
+        else
+          die "usage: catainer link NAME [ALIAS] [--target DIR] [--force]"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$name" ]] || die "usage: catainer link NAME [ALIAS] [--target DIR] [--force]"
+  alias="${alias:-$name}"
+  validate_name "$name"
+  validate_name "$alias"
+  [[ "$alias" != "." && "$alias" != ".." ]] || die "link alias cannot be '$alias'"
+  [[ "$alias" != "catainer" ]] || die "link alias 'catainer' would shadow the catainer command"
+
+  load_config "$name"
+  [[ -d "$(rootfs_path "$name")" ]] || die "rootfs missing for container '$name'"
+
+  target_dir="${target_dir:-$(default_shortcut_dir)}"
+  mkdir -p "$target_dir"
+
+  local target
+  local staged
+  local catainer_bin
+  target="${target_dir%/}/$alias"
+  staged="${target}.tmp.$$"
+  catainer_bin="$(script_path)"
+
+  if [[ "$force" != "1" && ( -e "$target" || -L "$target" ) ]]; then
+    die "link already exists: $target; pass --force to replace it"
+  fi
+
+  rm -f "$staged"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -Eeuo pipefail\n'
+    printf 'catainer_bin='
+    shell_quote "$catainer_bin"
+    printf '\n'
+    printf 'container_name='
+    shell_quote "$name"
+    printf '\n'
+    cat <<'EOF'
+
+if [[ ! -x "$catainer_bin" ]]; then
+  catainer_bin="$(command -v catainer || true)"
+fi
+
+if [[ -z "$catainer_bin" ]]; then
+  printf 'catainer link: catainer not found in PATH\n' >&2
+  exit 127
+fi
+
+if (($#)); then
+  exec "$catainer_bin" exec "$container_name" -- "$@"
+fi
+
+exec "$catainer_bin" shell "$container_name"
+EOF
+  } >"$staged" || {
+    rm -f "$staged"
+    die "could not write link: $target"
+  }
+
+  chmod +x "$staged" || {
+    rm -f "$staged"
+    die "could not mark link executable: $target"
+  }
+  mv -f "$staged" "$target" || {
+    rm -f "$staged"
+    die "could not install link: $target"
+  }
+
+  case ":$PATH:" in
+    *":$target_dir:"*) ;;
+    *) warn "link directory is not in PATH: $target_dir" ;;
+  esac
+
+  note "created link '$alias' for container '$name': $target"
+  note "open shell with: $alias"
+  note "run command with: $alias COMMAND..."
+}
+
+run_container_command() {
+  local name="$1"
+  shift
+
+  "$0" exec "$name" -- "$@"
+}
+
+cmd_update() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: catainer upgrade NAME"
+
+  load_config "$name"
+  case "$distro" in
+    ubuntu|debian|kali|mint|devuan)
+      run_container_command "$name" apt-get update
+      run_container_command "$name" apt-get upgrade -y
+      ;;
+    alpine)
+      run_container_command "$name" apk update
+      run_container_command "$name" apk upgrade
+      ;;
+    fedora|rockylinux|almalinux|oracle)
+      run_container_command "$name" dnf -y upgrade
+      ;;
+    archlinux)
+      run_container_command "$name" pacman -Syu --noconfirm
+      ;;
+    opensuse)
+      run_container_command "$name" /bin/sh -lc "zypper --non-interactive refresh && zypper --non-interactive update"
+      ;;
+    voidlinux)
+      run_container_command "$name" xbps-install -Syu
+      ;;
+    *)
+      die "no upgrade recipe for distro '$distro'; use catainer exec $name -- <package-manager>"
+      ;;
+  esac
+}
+
+cmd_status() {
+  ensure_dirs
+
+  local termux="no"
+  local host_arch
+  local dep
+  local state
+  local containers
+
+  is_termux && termux="yes"
+  host_arch="$(uname -m 2>/dev/null || printf 'unknown')"
+  containers="$(container_count)"
+
+  printf '%bcatainer %s%b\n' "$C_BOLD" "$VERSION" "$C_RESET"
+  printf 'Home:       %s\n' "$CAT_HOME"
+  printf 'Termux:     %s\n' "$termux"
+  printf 'Host arch:  %s\n' "$host_arch"
+  printf 'Containers: %s\n' "$containers"
+  printf 'Cache:      %s\n' "$CACHE_DIR"
+
+  printf '\nDependencies:\n'
+  for dep in proot tar curl sha256sum; do
+    if has_cmd "$dep"; then
+      state="ok"
+    else
+      state="missing"
+    fi
+    printf '  %-10s %s\n' "$dep" "$state"
+  done
+
+  printf '\nCompatibility defaults:\n'
+  printf '  no-seccomp:         %s\n' "${CAT_PROOT_NO_SECCOMP:-auto}"
+  printf '  new-seccomp:        %s\n' "${CAT_PROOT_ASSUME_NEW_SECCOMP:-auto}"
+  printf '  unset LD_PRELOAD:   %s\n' "${CAT_PROOT_UNSET_LD_PRELOAD:-auto}"
+  printf '  fake-root:          %s\n' "${CAT_PROOT_FAKE_ROOT:-auto}"
+  printf '  link2symlink:       %s\n' "${CAT_PROOT_LINK2SYMLINK:-auto}"
+
+  if load_update_cache 2>/dev/null; then
+    printf '\nUpdate cache:\n'
+    printf '  status:             %s\n' "${status:-unknown}"
+    [[ -n "${latest_version:-}" ]] && printf '  latest:             %s\n' "$latest_version"
+  fi
+}
+
+cmd_list() {
+  ensure_dirs
+
+  local found="0"
+  local dir
+  local name
+
+  for dir in "$CONTAINERS_DIR"/*; do
+    [[ -d "$dir" && -f "$dir/config" ]] || continue
+    found="1"
+    if [[ "$found" == "1" ]]; then
+      printf '%-18s %-10s %-14s %-12s %-10s %s\n' "NAME" "DISTRO" "RELEASE" "VARIANT" "ARCH" "HOSTNAME"
+      printf '%-18s %-10s %-14s %-12s %-10s %s\n' "------------------" "----------" "--------------" "------------" "----------" "--------"
+      found="2"
+    fi
+    name="${dir##*/}"
+    load_config "$name"
+    printf '%-18s %-10s %-14s %-12s %-10s %s\n' "$name" "$distro" "$release" "$variant" "$arch" "$hostname"
+  done
+
+  [[ "$found" != "0" ]] || note "no containers installed"
+}
+
+cmd_info() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: catainer inspect NAME"
+  load_config "$name"
+
+  printf 'Name:         %s\n' "$name"
+  printf 'Distro:       %s\n' "$distro"
+  printf 'Release:      %s\n' "$release"
+  printf 'Variant:      %s\n' "$variant"
+  printf 'Arch:         %s\n' "$arch"
+  printf 'Hostname:     %s\n' "$hostname"
+  printf 'Default user: %s\n' "$default_user"
+  printf 'Fake root:    %s\n' "$proot_fake_root"
+  printf 'Link2symlink: %s\n' "$proot_link2symlink"
+  printf 'Rootfs:       %s\n' "$(rootfs_path "$name")"
+  printf 'URL:          %s\n' "${url:-}"
+  printf '\nMounts:\n'
+  sed 's/^/  /' "$(mounts_path "$name")" 2>/dev/null || true
+  printf '\nEnvironment:\n'
+  sed 's/^/  /' "$(env_path "$name")" 2>/dev/null || true
+  printf '\nExtra proot args:\n'
+  sed 's/^/  /' "$(proot_args_path "$name")" 2>/dev/null || true
+}
+
+cmd_doctor() {
+  local name=""
+  local host_root="0"
+  local run_tests="0"
+
+  while (($#)); do
+    case "$1" in
+      --host-root|--real-root|--root)
+        host_root="1"
+        shift
+        ;;
+      --run-tests|--test)
+        run_tests="1"
+        shift
+        ;;
+      -h|--help)
+        cat <<'EOF'
+Usage:
+  catainer doctor [NAME] [--host-root] [--run-tests]
+EOF
+        return 0
+        ;;
+      -*)
+        die "unknown doctor option: $1"
+        ;;
+      *)
+        [[ -z "$name" ]] || die "usage: catainer doctor [NAME] [--host-root]"
+        name="$1"
+        shift
+        ;;
+    esac
+  done
+
+  local termux="no"
+  local uid="unknown"
+  local arch="unknown"
+  local proot_bin
+  local proot_version=""
+  local proot_env=()
+
+  is_termux && termux="yes"
+  uid="$(id -u 2>/dev/null || printf 'unknown')"
+  arch="$(uname -m 2>/dev/null || printf 'unknown')"
+  proot_bin="$(command -v proot || true)"
+
+  if [[ -n "$proot_bin" ]]; then
+    proot_version="$("$proot_bin" --version 2>&1 | sed -n '1p' || true)"
+  fi
+
+  proot_env_prefix proot_env
+
+  printf '%bcatainer doctor%b\n' "$C_BOLD" "$C_RESET"
+  printf 'Version:                  %s\n' "$VERSION"
+  printf 'Termux:                   %s\n' "$termux"
+  printf 'Host uid:                 %s\n' "$uid"
+  printf 'Host arch:                %s\n' "$arch"
+  printf 'PREFIX:                   %s\n' "${PREFIX:-unset}"
+  printf 'CAT_HOME:                 %s\n' "$CAT_HOME"
+  if [[ -n "$proot_bin" ]]; then
+    printf 'proot:                    %s\n' "$proot_bin"
+    [[ -n "$proot_version" ]] && printf 'proot version:            %s\n' "$proot_version"
+  else
+    printf 'proot:                    missing\n'
+  fi
+
+  printf '\nCompatibility settings:\n'
+  printf '  CAT_PROOT_NO_SECCOMP:           %s\n' "${CAT_PROOT_NO_SECCOMP:-auto}"
+  printf '  CAT_PROOT_ASSUME_NEW_SECCOMP:   %s\n' "${CAT_PROOT_ASSUME_NEW_SECCOMP:-auto}"
+  printf '  CAT_PROOT_UNSET_LD_PRELOAD:     %s\n' "${CAT_PROOT_UNSET_LD_PRELOAD:-auto}"
+  printf '  CAT_PROOT_FAKE_ROOT:            %s\n' "${CAT_PROOT_FAKE_ROOT:-auto}"
+  printf '  CAT_PROOT_LINK2SYMLINK:         %s\n' "${CAT_PROOT_LINK2SYMLINK:-auto}"
+  printf '  CAT_PROOT_TMP_DIR:              %s\n' "${CAT_PROOT_TMP_DIR:-${PROOT_TMP_DIR:-${TMP_DIR}/proot}}"
+  printf '  LD_PRELOAD:                     %s\n' "${LD_PRELOAD:-unset}"
+  printf '  PROOT_NO_SECCOMP:               %s\n' "${PROOT_NO_SECCOMP:-unset}"
+  printf '  PROOT_ASSUME_NEW_SECCOMP:       %s\n' "${PROOT_ASSUME_NEW_SECCOMP:-unset}"
+  printf '  PROOT_TMP_DIR:                  %s\n' "${PROOT_TMP_DIR:-unset}"
+
+  printf '\nEffective proot prefix:\n  '
+  print_argv "${proot_env[@]}"
+
+  if [[ "$run_tests" == "1" ]]; then
+    printf '\nRuntime tests:\n'
+    if [[ -z "$proot_bin" ]]; then
+      printf '  proot true:              skipped; proot missing\n'
+    elif "${proot_env[@]}" "$proot_bin" true >/dev/null 2>&1; then
+      printf '  proot true:              ok\n'
+    else
+      printf '  proot true:              failed\n'
+    fi
+  fi
+
+  [[ -n "$name" ]] || return 0
+
+  load_config "$name"
+
+  local rootfs
+  local shell_path=""
+  local su_path=""
+  local first_guest_process=""
+  local user="$default_user"
+  local home_dir="/root"
+  local workdir
+  local proot_args=()
+  local envs=()
+  local env_entry
+  local launcher=()
+
+  rootfs="$(rootfs_path "$name")"
+  [[ "$user" == "root" ]] || home_dir="/home/$user"
+  workdir="$home_dir"
+
+  if [[ -d "$rootfs" ]]; then
+    shell_path="$(find_shell "$rootfs" || true)"
+    if [[ "$user" != "root" ]]; then
+      for candidate in /bin/su /usr/bin/su; do
+        if [[ -x "$rootfs$candidate" ]]; then
+          su_path="$candidate"
+          break
+        fi
+      done
+    fi
+  fi
+
+  if [[ "$user" != "root" && -n "$su_path" ]]; then
+    first_guest_process="$su_path"
+  else
+    first_guest_process="$shell_path"
+  fi
+
+  printf '\nContainer:\n'
+  printf '  Name:                    %s\n' "$name"
+  printf '  Distro:                  %s\n' "$distro"
+  printf '  Release:                 %s\n' "$release"
+  printf '  Variant:                 %s\n' "$variant"
+  printf '  Arch:                    %s\n' "$arch"
+  printf '  Default user:            %s\n' "$default_user"
+  printf '  Config fake root:        %s\n' "$proot_fake_root"
+  printf '  Config link2symlink:     %s\n' "$proot_link2symlink"
+  printf '  Rootfs:                  %s\n' "$rootfs"
+  printf '  Rootfs exists:           %s\n' "$([[ -d "$rootfs" ]] && printf yes || printf no)"
+  printf '  Detected shell:          %s\n' "${shell_path:-missing}"
+  if [[ "$user" != "root" ]]; then
+    printf '  Detected su:             %s\n' "${su_path:-missing}"
+  fi
+  printf '  First guest process:     %s\n' "${first_guest_process:-missing}"
+
+  if [[ -z "$proot_bin" || -z "$shell_path" || ! -d "$rootfs" ]]; then
+    printf '\nEnter command preview: unavailable\n'
+    return 0
+  fi
+
+  build_proot_args "$name" "$rootfs" "$workdir" "$host_root" proot_args
+  while IFS= read -r -d '' env_entry; do
+    envs+=("$env_entry")
+  done < <(read_envs "$name" "$user" "$home_dir" "$shell_path")
+
+  if [[ "$user" != "root" && -n "$su_path" ]]; then
+    launcher=("${proot_env[@]}" "${envs[@]}" "$proot_bin" "${proot_args[@]}" "$su_path" - "$user")
+  else
+    launcher=("${proot_env[@]}" "${envs[@]}" "$proot_bin" "${proot_args[@]}" "$shell_path" -l)
+  fi
+
+  printf '\nEnter command preview:\n  '
+  print_argv "${launcher[@]}"
+
+  if [[ "$run_tests" == "1" ]]; then
+    local test_args=()
+    local test_output=""
+
+    build_proot_args "$name" "$rootfs" "/" "$host_root" test_args
+    printf '\nContainer runtime test:\n'
+    if test_output="$("${proot_env[@]}" "${envs[@]}" "$proot_bin" "${test_args[@]}" "$shell_path" -lc 'printf catainer-ok' 2>&1)"; then
+      printf '  shell exec:              ok'
+      [[ -n "$test_output" ]] && printf ' (%s)' "$test_output"
+      printf '\n'
+    else
+      printf '  shell exec:              failed\n'
+      printf '%s\n' "$test_output" | sed 's/^/    /'
+    fi
+  fi
+}
+
+cmd_mount() {
+  local name="${1:-}"
+  local spec="${2:-}"
+  [[ -n "$name" && -n "$spec" ]] || die "usage: catainer mount NAME SOURCE:TARGET[:ro]"
+  load_config "$name"
+  [[ "$spec" == *:* ]] || die "invalid mount spec '$spec'"
+  printf '%s\n' "$spec" >>"$(mounts_path "$name")"
+  note "added mount to '$name': $spec"
+}
+
+cmd_env() {
+  local name="${1:-}"
+  local spec="${2:-}"
+  [[ -n "$name" && -n "$spec" ]] || die "usage: catainer env NAME KEY=VALUE"
+  load_config "$name"
+  validate_env_spec "$spec"
+  printf '%s\n' "$spec" >>"$(env_path "$name")"
+  note "added env to '$name': $spec"
+}
+
+cmd_proot_arg() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: catainer args NAME ARG..."
+  shift
+  (($# > 0)) || die "usage: catainer args NAME ARG..."
+  load_config "$name"
+
+  local arg
+  for arg in "$@"; do
+    printf '%s\n' "$arg" >>"$(proot_args_path "$name")"
+  done
+  note "added $# proot arg(s) to '$name'"
+}
+
+normalize_compat_mode() {
+  local key="$1"
+  local value="$2"
+
+  case "$value" in
+    auto|"") printf 'auto\n' ;;
+    always|yes|true|1) printf 'always\n' ;;
+    never|no|false|0) printf 'never\n' ;;
+    *) die "invalid $key value '$value'; expected auto, always, or never" ;;
+  esac
+}
+
+set_config_value() {
+  local name="$1"
+  local key="$2"
+  local value="$3"
+  local file
+  local tmp
+
+  file="$(config_path "$name")"
+  tmp="${file}.tmp"
+
+  grep -vE "^${key}=" "$file" >"$tmp" || true
+  {
+    cat "$tmp"
+    write_config_value "$key" "$value"
+  } >"$file"
+  rm -f "$tmp"
+}
+
+print_compat_profile() {
+  local name="$1"
+
+  load_config "$name"
+  printf 'Container:       %s\n' "$name"
+  printf 'Fake root:       %s\n' "$proot_fake_root"
+  printf 'Link2symlink:    %s\n' "$proot_link2symlink"
+
+  if [[ "$proot_fake_root" == "never" && "$proot_link2symlink" == "never" ]]; then
+    printf 'Profile:         android-safe\n'
+  elif [[ "$proot_fake_root" == "auto" && "$proot_link2symlink" == "auto" ]]; then
+    printf 'Profile:         default\n'
+  else
+    printf 'Profile:         custom\n'
+  fi
+}
+
+cmd_compat() {
+  local name="${1:-}"
+  local profile="${2:-show}"
+
+  case "$name" in
+    -h|--help)
+      cat <<'EOF'
+Usage:
+  catainer compat NAME [show|android-safe|default]
+
+Profiles:
+  show          print the saved proot compatibility settings
+  android-safe  disable fake-root and link2symlink for strict Android kernels
+  default       reset fake-root and link2symlink to automatic mode
+EOF
+      return 0
+      ;;
+  esac
+
+  [[ -n "$name" && "$name" != -* ]] || die "usage: catainer compat NAME [show|android-safe|default]"
+  load_config "$name"
+
+  case "$profile" in
+    show|"")
+      print_compat_profile "$name"
+      ;;
+    -h|--help)
+      cat <<'EOF'
+Usage:
+  catainer compat NAME [show|android-safe|default]
+
+Profiles:
+  show          print the saved proot compatibility settings
+  android-safe  disable fake-root and link2symlink for strict Android kernels
+  default       reset fake-root and link2symlink to automatic mode
+EOF
+      ;;
+    android-safe|safe|fallback|no2)
+      set_config_value "$name" proot_fake_root never
+      set_config_value "$name" proot_link2symlink never
+      note "set compatibility profile for '$name': android-safe"
+      print_compat_profile "$name"
+      ;;
+    default|auto|reset)
+      set_config_value "$name" proot_fake_root auto
+      set_config_value "$name" proot_link2symlink auto
+      note "set compatibility profile for '$name': default"
+      print_compat_profile "$name"
+      ;;
+    *)
+      die "unknown compatibility profile '$profile'; expected show, android-safe, or default"
+      ;;
+  esac
+}
+
+cmd_config() {
+  local name="${1:-}"
+  local spec="${2:-}"
+  [[ -n "$name" && -n "$spec" ]] || die "usage: catainer set NAME KEY=VALUE"
+  load_config "$name"
+  [[ "$spec" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || die "invalid config spec '$spec'"
+
+  local key="${spec%%=*}"
+  local value="${spec#*=}"
+  case "$key" in
+    hostname|default_user)
+      ;;
+    proot_fake_root|proot_link2symlink)
+      value="$(normalize_compat_mode "$key" "$value")"
+      ;;
+    *)
+      die "config key '$key' is not mutable; supported: hostname, default_user, proot_fake_root, proot_link2symlink"
+      ;;
+  esac
+
+  set_config_value "$name" "$key" "$value"
+
+  if [[ "$key" == "hostname" ]]; then
+    printf '%s\n' "$value" >"$(rootfs_path "$name")/etc/hostname"
+  fi
+
+  note "updated $key for '$name'"
+}
+
+confirm_remove() {
+  local prompt="$1"
+
+  if [[ "${CAT_ASSUME_YES:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  [[ -t 0 ]] || return 1
+  printf '%s [y/N] ' "$prompt" >&2
+  local answer
+  read -r answer
+  [[ "$answer" == "y" || "$answer" == "Y" || "$answer" == "yes" || "$answer" == "YES" ]]
+}
+
+cmd_remove() {
+  local name="${1:-}"
+  local force="0"
+  [[ -n "$name" ]] || die "usage: catainer delete NAME [--force]"
+  shift || true
+
+  while (($#)); do
+    case "$1" in
+      -f|--force) force="1"; shift ;;
+      *) die "unknown delete option: $1" ;;
+    esac
+  done
+
+  load_config "$name"
+  if [[ "$force" != "1" ]]; then
+    confirm_remove "Delete container '$name'?" || die "delete cancelled"
+  fi
+
+  rm -rf "$(container_dir "$name")"
+  note "deleted container '$name'"
+}
+
+cmd_backup() {
+  local name="${1:-}"
+  local output="${2:-}"
+  [[ -n "$name" ]] || die "usage: catainer backup NAME [OUTPUT.tar.gz]"
+  load_config "$name"
+
+  output="${output:-${name}-catainer-backup-$(date -u +%Y%m%d%H%M%S).tar.gz}"
+  tar -czf "$output" -C "$CONTAINERS_DIR" "$name"
+  note "wrote backup: $output"
+}
+
+cmd_restore() {
+  local name="${1:-}"
+  local archive="${2:-}"
+  local force="0"
+  [[ -n "$name" && -n "$archive" ]] || die "usage: catainer restore NAME ARCHIVE.tar.gz [--force]"
+  shift 2
+
+  while (($#)); do
+    case "$1" in
+      -f|--force) force="1"; shift ;;
+      *) die "unknown restore option: $1" ;;
+    esac
+  done
+
+  validate_name "$name"
+  [[ -f "$archive" ]] || die "backup archive not found: $archive"
+  ensure_dirs
+
+  local dir
+  dir="$(container_dir "$name")"
+  if [[ -e "$dir" ]]; then
+    [[ "$force" == "1" ]] || die "container '$name' already exists; pass --force"
+    rm -rf "$dir"
+  fi
+
+  local staging
+  staging="$TMP_DIR/restore-${name}-$$"
+  rm -rf "$staging"
+  mkdir -p "$staging"
+  tar -xzf "$archive" -C "$staging"
+
+  local first
+  first="$(find "$staging" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+  [[ -n "$first" && -f "$first/config" && -d "$first/rootfs" ]] || die "archive does not look like a catainer backup"
+
+  mv "$first" "$dir"
+  rm -rf "$staging"
+
+  grep -vE '^name=' "$dir/config" >"$dir/config.tmp"
+  {
+    cat "$dir/config.tmp"
+    write_config_value name "$name"
+  } >"$dir/config"
+  rm -f "$dir/config.tmp"
+
+  note "restored container '$name'"
+}
+
+cmd_check_update() {
+  local refresh="0"
+  local quiet="0"
+
+  while (($#)); do
+    case "$1" in
+      -r|--refresh) refresh="1"; shift ;;
+      -q|--quiet) quiet="1"; shift ;;
+      -h|--help)
+        cat <<'EOF'
+Usage:
+  catainer updates [--refresh] [--quiet]
+EOF
+        return 0
+        ;;
+      *) die "unknown updates option: $1" ;;
+    esac
+  done
+
+  if [[ "$refresh" == "1" ]] || ! update_cache_is_fresh; then
+    if ! check_catainer_update; then
+      load_update_cache || true
+      [[ "$quiet" == "1" ]] && return 1
+      die "could not check for catainer updates: ${message:-unknown error}"
+    fi
+  fi
+
+  load_update_cache || die "no update status available"
+
+  case "$status" in
+    available)
+      [[ "$quiet" == "1" ]] || {
+        printf 'catainer update available: %s -> %s\n' "$VERSION" "$latest_version"
+        printf 'Run: catainer self-update\n'
+      }
+      ;;
+    current)
+      [[ "$quiet" == "1" ]] || printf 'catainer is current: %s\n' "$VERSION"
+      ;;
+    error)
+      [[ "$quiet" == "1" ]] && return 1
+      die "could not check for catainer updates: ${message:-unknown error}"
+      ;;
+    *)
+      [[ "$quiet" == "1" ]] && return 1
+      die "unknown update status '${status:-}'"
+      ;;
+  esac
+}
+
+cmd_self_update() {
+  local target=""
+  local url
+  local force="0"
+  local dry_run="0"
+  local tmp
+  local new_version
+  local backup
+  local target_dir
+  local target_base
+  local staged
+
+  url="$(catainer_update_url)"
+
+  while (($#)); do
+    case "$1" in
+      --target)
+        require_option_value "$1" "${2:-}"
+        target="$2"
+        shift 2
+        ;;
+      --target=*)
+        target="${1#*=}"
+        shift
+        ;;
+      --url)
+        require_option_value "$1" "${2:-}"
+        url="$2"
+        shift 2
+        ;;
+      --url=*)
+        url="${1#*=}"
+        shift
+        ;;
+      -f|--force)
+        force="1"
+        shift
+        ;;
+      --dry-run)
+        dry_run="1"
+        shift
+        ;;
+      -h|--help)
+        cat <<'EOF'
+Usage:
+  catainer self-update [--target PATH] [--url URL] [--force] [--dry-run]
+EOF
+        return 0
+        ;;
+      *) die "unknown self-update option: $1" ;;
+    esac
+  done
+
+  ensure_dirs
+  target="${target:-$(script_path)}"
+  tmp="${TMP_DIR}/catainer-update.$$"
+  rm -f "$tmp"
+
+  note "checking catainer update from $url"
+  download_file "$url" "$tmp"
+  new_version="$(extract_script_version <"$tmp")"
+  [[ -n "$new_version" ]] || {
+    rm -f "$tmp"
+    die "downloaded catainer script did not expose VERSION"
+  }
+
+  bash -n "$tmp" || {
+    rm -f "$tmp"
+    die "downloaded catainer script failed syntax check"
+  }
+
+  if [[ "$force" != "1" ]] && ! version_gt "$new_version" "$VERSION"; then
+    write_update_cache current "$new_version" "$url" ""
+    rm -f "$tmp"
+    note "catainer is already current: $VERSION"
+    return 0
+  fi
+
+  if [[ "$dry_run" == "1" ]]; then
+    rm -f "$tmp"
+    printf 'catainer update ready: %s -> %s\n' "$VERSION" "$new_version"
+    printf 'Target: %s\n' "$target"
+    return 0
+  fi
+
+  target_dir="$(dirname "$target")"
+  target_base="$(basename "$target")"
+  staged="${target_dir}/.${target_base}.new.$$"
+  rm -f "$staged"
+
+  mkdir -p "$target_dir"
+  if [[ -e "$target" && ! -w "$target" ]]; then
+    rm -f "$tmp"
+    die "target is not writable: $target"
+  fi
+
+  if [[ -f "$target" ]]; then
+    backup="${target}.bak"
+    cp "$target" "$backup" 2>/dev/null || warn "could not write backup: $backup"
+  fi
+
+  cp "$tmp" "$staged" || {
+    rm -f "$tmp" "$staged"
+    die "could not stage update at: $staged"
+  }
+  chmod +x "$staged" || {
+    rm -f "$tmp" "$staged"
+    die "could not mark staged update executable: $staged"
+  }
+  mv -f "$staged" "$target" || {
+    rm -f "$tmp" "$staged"
+    die "could not install update to: $target"
+  }
+  rm -f "$tmp"
+  write_update_cache current "$new_version" "$url" ""
+
+  note "updated catainer: $VERSION -> $new_version"
+  note "installed to: $target"
+}
+
+cmd_self_install() {
+  local target="${1:-}"
+
+  if [[ -z "$target" ]]; then
+    if [[ -n "${PREFIX:-}" && -d "$PREFIX/bin" ]]; then
+      target="$PREFIX/bin/catainer"
+    else
+      target="$HOME/.local/bin/catainer"
+    fi
+  fi
+
+  mkdir -p "$(dirname "$target")"
+  cp "$0" "$target"
+  chmod +x "$target"
+  note "installed catainer to $target"
+}
+
+main() {
+  local command="${1:-}"
+  [[ -n "$command" ]] || {
+    run_default_action
+    exit 0
+  }
+  shift || true
+
+  case "$command" in
+    -h|--help|help) usage ;;
+    -V|--version|version) printf 'catainer %s\n' "$VERSION" ;;
+    setup|deps) cmd_deps "$@" ;;
+    sources|distros) cmd_distros "$@" ;;
+    releases|versions) cmd_versions "$@" ;;
+    flavors|variants) cmd_variants "$@" ;;
+    create|new|install) cmd_install "$@" ;;
+    shell|enter) cmd_enter "$@" ;;
+    exec|run) cmd_run "$@" ;;
+    root-shell|root-enter) cmd_root_enter "$@" ;;
+    root-exec|root-run) cmd_root_run "$@" ;;
+    login|pam-login) cmd_login "$@" ;;
+    distro-login|login-bin|raw-login) cmd_login --method login "$@" ;;
+    link|shortcut|launcher) cmd_shortcut "$@" ;;
+    upgrade|update) cmd_update "$@" ;;
+    status|overview) cmd_status "$@" ;;
+    ls|list) cmd_list "$@" ;;
+    inspect|info|show) cmd_info "$@" ;;
+    compat|compatibility) cmd_compat "$@" ;;
+    doctor|diag|diagnose) cmd_doctor "$@" ;;
+    mount) cmd_mount "$@" ;;
+    env) cmd_env "$@" ;;
+    args|arg|proot-args|proot-arg) cmd_proot_arg "$@" ;;
+    set|config) cmd_config "$@" ;;
+    backup) cmd_backup "$@" ;;
+    restore) cmd_restore "$@" ;;
+    delete|remove|rm) cmd_remove "$@" ;;
+    updates|check-update|update-check) cmd_check_update "$@" ;;
+    self-update|upgrade-catainer) cmd_self_update "$@" ;;
+    self-install) cmd_self_install "$@" ;;
+    --menu)
+      die "interactive mode was removed; run 'catainer' for the command overview"
+      ;;
+    --name|--name=*|-d|--distro|--distro=*|-r|--release|--release=*|-a|--arch|--arch=*|--variant|--variant=*|--url|--url=*|--mirror|--mirror=*|--hostname|--hostname=*|--select|--no-select|--yes|--skip-deps|--no-default-mounts)
+      die "create options must follow a create command; use: catainer create NAME --distro DISTRO [options]"
+      ;;
+    *) die "unknown command '$command'; run: catainer --help" ;;
+  esac
+}
+
+ORIGINAL_ARGS=("$@")
+parse_top_level_args "$@"
+setup_colors
+main "${MAIN_ARGS[@]}"
