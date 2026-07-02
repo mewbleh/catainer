@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Syntax
+        run: |
+          bash -n catainer
+          sh -n install.sh
+
+      - name: ShellCheck
+        run: shellcheck -x catainer install.sh
+
+      - name: README fences
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          text = Path("README.md").read_text()
+          count = text.count("```")
+          if count % 2:
+              raise SystemExit(f"unbalanced code fences: {count}")
+          print(f"code fences ok: {count}")
+          PY
